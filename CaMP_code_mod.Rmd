@@ -1,0 +1,165 @@
+---
+title: "CaMP: California Mast Prediction Tool"
+output: html_document
+date: "2024-10-01"
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+# Load necessary libraries
+library(shiny)
+library(shinyWidgets)
+library(leaflet)
+library(dplyr)
+library(showtext)
+library(tidyr)
+
+# Add Google Font and enable showtext
+font_add_google("Montserrat", "MS")
+showtext_auto()
+```
+
+```{r ui}
+ui <- fluidPage(
+  setBackgroundColor("black"),
+  tags$h1("California Mast Prediction Tool", style = "color: white; font-family: 'MS'"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      sliderInput("year", "Select Year:", min = 1990, max = 2020, value = 2010, sep = "", step = 1,
+                  animate = animationOptions(interval = 1500, loop = FALSE)),
+      checkboxInput("compareYears", "Compare All Years", value = FALSE),
+      checkboxGroupInput("species_selected", "Select Species for Map:", choices = NULL),
+      actionButton("selectAll", "Select All Species"),
+      actionButton("uncheckAll", "Uncheck All Species")
+    ),
+    mainPanel(
+      leafletOutput("map"),
+      textOutput("statusText")
+    )
+  )
+)
+```
+
+```{r server}
+server <- function(input, output, session) {
+  previousYear <- reactiveVal(NULL)
+
+  # Load data from GitHub
+  all_data <- reactive({
+    files <- c("abies_fecundity_XYmod.csv", "oaks_fecundity_XYmod.csv", "pine_fecundity_XYmod.csv")
+    fec <- NULL
+
+    for (i in files) {
+      github_url <- paste0("https://raw.githubusercontent.com/dchuebner/calMASTIFcone/main/", i)
+      f <- read.csv(github_url) %>%
+        drop_na() %>%
+        dplyr::select(Species, TREE_ID, X, Y, Year, logF_current)
+      fec <- rbind(fec, f)
+    }
+
+    fec %>%
+      group_by(Species, TREE_ID) %>%
+      mutate(fec_ntile = ntile(logF_current, n = 4))
+  })
+
+  species_data <- reactive({
+    req(all_data())
+    all_data()
+  })
+
+  # Update species checkbox choices after data loads
+  observe({
+    req(species_data())
+    species_choices <- unique(species_data()$Species)
+    updateCheckboxGroupInput(session, "species_selected",
+                             choices = species_choices,
+                             selected = species_choices)
+  })
+
+  # Save previously selected year
+  observeEvent(input$year, {
+    previousYear(input$year)
+  })
+
+  # Select All / Uncheck All buttons
+  observeEvent(input$selectAll, {
+    updateCheckboxGroupInput(session, "species_selected",
+                             selected = unique(species_data()$Species))
+  })
+
+  observeEvent(input$uncheckAll, {
+    updateCheckboxGroupInput(session, "species_selected", selected = character(0))
+  })
+
+  # Initial map render
+  output$map <- renderLeaflet({
+    leaflet(options = leafletOptions(zoomControl = TRUE, boxZoom = TRUE)) %>%
+      addProviderTiles(providers$CartoDB.Positron) %>%
+      setView(lng = -119.418, lat = 36.778, zoom = 6) %>%
+      addControl(
+        html = "<div style='background: white; padding: 6px; border-radius: 6px; font-size: 14px; box-shadow: 2px 2px 4px rgba(0,0,0,0.3);'>
+                 🛈 Hold <b>Shift</b> and drag to draw a box and zoom in
+               </div>",
+        position = "topright"
+      )
+  })
+
+  # Update map based on selections
+  observe({
+    req(species_data(), input$species_selected, input$year)
+
+    selected_species <- input$species_selected
+    selected_year <- input$year
+    prev_year <- isolate(previousYear())
+
+    # Filter logic
+    if (!is.null(prev_year) && prev_year != selected_year && isTRUE(input$compareYears)) {
+      filtered_data <- species_data() %>%
+        filter(Species %in% selected_species, Year %in% c(selected_year, prev_year))
+    } else {
+      filtered_data <- species_data() %>%
+        filter(Species %in% selected_species, Year == selected_year)
+    }
+
+    if (nrow(filtered_data) == 0) return()
+
+    pal <- colorNumeric(c("red", "blue"), filtered_data$fec_ntile)
+
+    leafletProxy("map", data = filtered_data) %>%
+      clearMarkers() %>%
+      clearControls() %>%
+      addCircleMarkers(
+        lng = ~X, lat = ~Y, radius = 3, color = ~pal(fec_ntile),
+        opacity = 0.8,
+        popup = ~paste0(
+          "<b>Species:</b> ", Species, "<br>",
+          "<b>Tree:</b> ", TREE_ID, "<br>",
+          "<b>Year:</b> ", Year, "<br>",
+          "<b>Fecundity:</b> ", logF_current, "<br>",
+          "<b>Quartile:</b> ", fec_ntile
+        )
+      ) %>%
+      addLegend("bottomright", pal = pal, values = ~fec_ntile, title = "Fecundity", opacity = 1) %>%
+      addControl(
+        html = "<div style='background: white; padding: 6px; border-radius: 6px; font-size: 14px; box-shadow: 2px 2px 4px rgba(0,0,0,0.3);'>
+                 🛈 Hold <b>Shift</b> and drag to draw a box and zoom in
+               </div>",
+        position = "topright"
+      )
+  })
+
+  # Status text
+  output$statusText <- renderText({
+    if (is.null(species_data())) {
+      "Loading data..."
+    } else {
+      "Data loaded successfully."
+    }
+  })
+}
+```
+
+```{r app}
+shinyApp(ui = ui, server = server)
+```
