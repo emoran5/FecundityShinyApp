@@ -11,6 +11,7 @@ library(shiny)
 library(shinyWidgets)
 library(leaflet)
 library(dplyr)
+library(readr)
 library(showtext)
 library(tidyr)
 
@@ -46,22 +47,43 @@ server <- function(input, output, session) {
   previousYear <- reactiveVal(NULL)
 
   # Load data from GitHub
+ 
   all_data <- reactive({
-    files <- c("abies_fecundity_XYmod.csv", "oaks_fecundity_XYmod.csv", "pine_fecundity_XYmod.csv")
-    fec <- NULL
+  files <- c("abies_fecundity_XYmod.csv", "oaks_fecundity_XYmod.csv", "pine_fecundity_XYmod.csv")
+  fec <- NULL
 
-    for (i in files) {
-      github_url <- paste0("https://raw.githubusercontent.com/dchuebner/calMASTIFcone/main/", i)
-      f <- read.csv(github_url) %>%
-        drop_na() %>%
-        dplyr::select(Species, TREE_ID, X, Y, Year, logF_current)
-      fec <- rbind(fec, f)
-    }
+  for (i in files) {
+    github_url <- paste0("https://raw.githubusercontent.com/dchuebner/calMASTIFcone/main/", i)
+    f <- read.csv(github_url) %>%
+      drop_na() %>%
+      dplyr::select(Species, TREE_ID, X, Y, Year, logF_current)
+    fec <- bind_rows(fec, f)
+  }
+ 
 
-    fec %>%
-      group_by(Species, TREE_ID) %>%
-      mutate(fec_ntile = ntile(logF_current, n = 4))
-  })
+  # Use the first observed coordinates for each TREE_ID as fixed location
+#coords_fixed <- fec %>%
+  #group_by(Species, TREE_ID) %>%
+  #summarise(
+   # X_fixed = first(X),
+    #Y_fixed = first(Y),
+    #.groups = "drop"
+  #)
+
+# Join fixed coords back in
+#fec <- fec %>%
+  #left_join(coords_fixed, by = c("Species", "TREE_ID")) %>%
+  #mutate(X = X_fixed, Y = Y_fixed) %>%
+  #select(-X_fixed, -Y_fixed)
+
+
+  # Quartiles
+  fec %>%
+    group_by(Species, TREE_ID) %>%
+    mutate(fec_ntile = ntile(logF_current, 4)) %>%
+    ungroup()
+})
+
 
   species_data <- reactive({
     req(all_data())
@@ -96,7 +118,7 @@ server <- function(input, output, session) {
   output$map <- renderLeaflet({
     leaflet(options = leafletOptions(zoomControl = TRUE, boxZoom = TRUE)) %>%
       addProviderTiles(providers$CartoDB.Positron) %>%
-      setView(lng = -119.418, lat = 36.778, zoom = 6) %>%
+      setView(lng = -119.418, lat = 36.778, zoom = 5) %>%
       addControl(
         html = "<div style='background: white; padding: 6px; border-radius: 6px; font-size: 14px; box-shadow: 2px 2px 4px rgba(0,0,0,0.3);'>
                  🛈 Hold <b>Shift</b> and drag to draw a box and zoom in
