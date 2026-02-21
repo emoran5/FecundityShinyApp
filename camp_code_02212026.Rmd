@@ -774,6 +774,7 @@ getSeeds <- function(data) {
 ```
 
 ```{r server}
+library(shiny)
 library(cachem)
 library(memoise)
 library(dplyr)
@@ -786,106 +787,103 @@ PRISM_CACHE <- cachem::cache_disk(dir = PRISM_CACHE_DIR)
 
 server <- function(input, output, session) {
 
-  # Memoised wrappers (disk cache shared across sessions on the host)
   getClimate_cached <- memoise::memoise(getClimate, cache = PRISM_CACHE)
   getNorm_cached    <- memoise::memoise(getNorm,    cache = PRISM_CACHE)
 
-  # ---- species choices (use FIA or fixed list) ----
-  # If you want FIA-derived species, replace this with your FIA species extraction.
-  species_master <- sort(c(
-    "Pinus ponderosa","Pinus contorta","Pinus jeffreyi","Pinus lambertiana","Pinus monticola",
-    "Quercus kelloggii","Quercus agrifolia","Quercus chrysolepis",
-    "Abies magnifica","Abies grandis","Abies concolor"
-  ))
+  # ---- build treeNames (FIA) once per session ----
+  treeNames <- reactive({
+    plot.list <- read.csv("https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/FIA/CA_PLOT.csv") %>%
+      dplyr::rename(Plot = 4, Unit = 2, County = 3, STATE = 1, UTMy = 5, UTMx = 6) %>%
+      tidyr::unite(Plot, Plot, Unit, County, STATE, sep = "_") %>%
+      dplyr::distinct()
 
-  observeEvent(TRUE, {
-    updateCheckboxGroupInput(
-      session, "species_selected",
-      choices = species_master,
-      selected = species_master
-    )
-  }, once = TRUE)
+    tree.list <- read.csv("https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/FIA/CA_TREE.csv") %>%
+      dplyr::rename(Year = INVYR, Plot = PLOT, Unit = UNITCD, County = COUNTYCD, STATE = STATECD,
+                    Subplot = SUBP, Tree = TREE, Diameter = DIA, SPCD = SPCD,
+                    SHADE = CLIGHTCD, canopy = CCLCD) %>%
+      tidyr::unite(Plot, Plot, Unit, County, STATE, sep = "_") %>%
+      dplyr::distinct()
+
+    PLOT_TREE <- dplyr::left_join(plot.list, tree.list)
+
+    sp_names <- read.csv("https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/FIA/SPC_ID.csv") %>%
+      dplyr::select(SPCD, SCI_NAME)
+
+    merge(PLOT_TREE, sp_names) %>%
+      dplyr::rename(Species = SCI_NAME) %>%
+      dplyr::group_by(Species, Plot, Subplot, Tree) %>%
+      dplyr::filter(Year == max(Year)) %>%
+      dplyr::select(Species, Plot, Subplot, Tree, UTMx, UTMy, Diameter) %>%
+      dplyr::distinct() %>%
+      tidyr::unite("TREE_ID", c(Plot, Subplot, Tree), sep = "_")
+  })
+
+  # ---- species choices (from FIA treeNames, not hard-coded) ----
+  observeEvent(treeNames(), {
+    sp <- sort(unique(treeNames()$Species))
+    updateCheckboxGroupInput(session, "species_selected", choices = sp, selected = sp)
+  }, ignoreInit = FALSE)
 
   observeEvent(input$selectAll, {
-    updateCheckboxGroupInput(session, "species_selected", selected = species_master)
+    req(treeNames())
+    updateCheckboxGroupInput(session, "species_selected", selected = sort(unique(treeNames()$Species)))
   })
 
   observeEvent(input$uncheckAll, {
     updateCheckboxGroupInput(session, "species_selected", selected = character(0))
   })
 
-  # ---- run PRISM + getSeeds when year/species change ----
-  # Debounce prevents hammering PRISM while the slider is being dragged
-  year_db <- shiny::debounce(reactive(input$year), millis = 600)
-  sp_db   <- shiny::debounce(reactive(input$species_selected), millis = 600)
+  # ---- base map ----
+  output$map <- renderLeaflet({
+    leaflet(options = leafletOptions(zoomControl = TRUE, boxZoom = TRUE)) %>%
+      addProviderTiles(providers$CartoDB.Positron) %>%
+      setView(lng = -119.418, lat = 36.778, zoom = 5)
+  })
 
-seed_points <- eventReactive(input$runClimate, {
-  req(input$year, input$species_selected)
-  yr <- as.integer(input$year)
-  sp <- sort(input$species_selected)
-  validate(need(length(sp) > 0, "Select at least one species."))
+  # ---- PRISM + getSeeds on click ----
+  seed_points <- eventReactive(input$runClimate, {
+    req(input$year, input$species_selected, treeNames())
 
-  clim_out <- getClimate_cached(sp, yr)
-  norm_out <- getNorm_cached(sp, yr)
+    # Make treeNames available in this scope for functions that expect it
+    treeNames <- treeNames()
 
-  anom <- merge(clim_out, norm_out) %>%
-    mutate(Value = Value - normValue) %>%
-    select(Species, TREE_ID, Year, Phase, Value) %>%
-    pivot_wider(names_from = Phase, values_from = Value) %>%
-    drop_na()
+    yr <- as.integer(input$year)
+    sp <- sort(input$species_selected)
+    validate(need(length(sp) > 0, "Select at least one species."))
 
-  getSeeds(anom)
-}, ignoreInit = TRUE)
+    output$statusText <- renderText("Running PRISM downloads + computing forecasts...")
 
-  # ---- initial map ----
-output$map <- renderLeaflet({
-  seeds <- seed_points()
-  req(seeds)
+    clim_out <- getClimate_cached(sp, yr)
+    norm_out <- getNorm_cached(sp, yr)
 
-  # choose value column
-  value_col <- dplyr::case_when(
-    "logF_current" %in% names(seeds) ~ "logF_current",
-    "fecundity"    %in% names(seeds) ~ "fecundity",
-    "Value"        %in% names(seeds) ~ "Value",
-    TRUE ~ NA_character_
-  )
-  validate(need(!is.na(value_col), "No value column found to map."))
+    anom <- merge(clim_out, norm_out) %>%
+      mutate(Value = Value - normValue) %>%
+      select(Species, TREE_ID, Year, Phase, Value) %>%
+      pivot_wider(names_from = Phase, values_from = Value) %>%
+      drop_na()
 
-  pal <- leaflet::colorNumeric(c("red", "blue"), seeds[[value_col]])
+    seeds <- getSeeds(anom)
 
-  leaflet::leaflet(seeds) %>%
-    leaflet::addProviderTiles(leaflet::providers$CartoDB.Positron) %>%
-    leaflet::addCircleMarkers(
-      lng = ~X, lat = ~Y, radius = 3,
-      color = ~pal(.data[[value_col]]),
-      opacity = 0.8,
-      popup = ~paste0(
-        "<b>Species:</b> ", Species, "<br>",
-        "<b>Tree:</b> ", TREE_ID, "<br>",
-        "<b>Year:</b> ", yr, "<br>",
-        "<b>Predicted:</b> ", round(.data[[value_col]], 3)
-      )
-    ) %>%
-    leaflet::addLegend("bottomright", pal = pal, values = seeds[[value_col]],
-                       title = "Predicted", opacity = 1)
-})
+    list(seeds = seeds, year = yr)
+  }, ignoreInit = TRUE)
 
-  # ---- remap whenever seed_points changes ----
-  observe({
-    seeds <- seed_points()
-    req(seeds)
-    validate(need(nrow(seeds) > 0, "No seed predictions returned for this selection."))
+  observeEvent(seed_points(), {
+    res <- seed_points()
+    seeds <- res$seeds
+    yr <- res$year
 
-    # Pick a value column to color by (change this to your actual output column)
+    validate(need(!is.null(seeds) && nrow(seeds) > 0, "No results returned for this selection."))
+
     value_col <- dplyr::case_when(
       "logF_current" %in% names(seeds) ~ "logF_current",
       "fecundity"    %in% names(seeds) ~ "fecundity",
       "Value"        %in% names(seeds) ~ "Value",
       TRUE ~ NA_character_
     )
-    validate(need(!is.na(value_col), "Could not find a value column to map (e.g., logF_current/fecundity/Value)."))
+    validate(need(!is.na(value_col), "No value column found (expected logF_current/fecundity/Value)."))
+    validate(need(all(c("X","Y") %in% names(seeds)), "Expected X and Y columns for mapping."))
 
-    pal <- colorNumeric(c("red", "blue"), seeds[[value_col]])
+    pal <- leaflet::colorNumeric(c("red", "blue"), seeds[[value_col]])
 
     leafletProxy("map", data = seeds) %>%
       clearMarkers() %>%
@@ -901,15 +899,17 @@ output$map <- renderLeaflet({
           "<b>Predicted:</b> ", round(.data[[value_col]], 3)
         )
       ) %>%
-      addLegend("bottomright", pal = pal, values = seeds[[value_col]], title = "Predicted", opacity = 1)
-  })
+      addLegend("bottomright", pal = pal, values = seeds[[value_col]],
+                title = "Predicted", opacity = 1)
+
+    output$statusText <- renderText(
+      paste("Last run:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+            "Year:", yr, "Points:", nrow(seeds))
+    )
+  }, ignoreInit = TRUE)
 
   output$statusText <- renderText({
-    if (isTruthy(input$year) && isTruthy(input$species_selected)) {
-      "Ready. Updating map when inputs change."
-    } else {
-      "Select a year and species."
-    }
+    "Select a year and species, then click 'Get Forecasts'."
   })
 }
 ```
