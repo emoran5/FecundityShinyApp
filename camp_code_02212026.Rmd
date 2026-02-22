@@ -790,6 +790,21 @@ server <- function(input, output, session) {
   getClimate_cached <- memoise::memoise(getClimate, cache = PRISM_CACHE)
   getNorm_cached    <- memoise::memoise(getNorm,    cache = PRISM_CACHE)
 
+  # ---- your defined Species list (used to filter treeNames + UI options) ----
+  Species <- sort(c(
+    "Pinus ponderosa",
+    "Pinus contorta",
+    "Pinus jeffreyi",
+    "Pinus lambertiana",
+    "Pinus monticola",
+    "Quercus kelloggii",
+    "Quercus agrifolia",
+    "Quercus chrysolepis",
+    "Abies magnifica",
+    "Abies grandis",
+    "Abies concolor"
+  ))
+
   # ---- build treeNames (FIA) once per session ----
   treeNames <- reactive({
     plot.list <- read.csv("https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/FIA/CA_PLOT.csv") %>%
@@ -815,18 +830,21 @@ server <- function(input, output, session) {
       dplyr::filter(Year == max(Year)) %>%
       dplyr::select(Species, Plot, Subplot, Tree, UTMx, UTMy, Diameter) %>%
       dplyr::distinct() %>%
-      tidyr::unite("TREE_ID", c(Plot, Subplot, Tree), sep = "_")
+      tidyr::unite("TREE_ID", c(Plot, Subplot, Tree), sep = "_") %>%
+      dplyr::filter(Species %in% Species)  # <-- filter to your defined list
   })
 
-  # ---- species choices (from FIA treeNames, not hard-coded) ----
+  # ---- species choices (filtered to your Species list) ----
   observeEvent(treeNames(), {
-    sp <- sort(unique(treeNames()$Species))
+    # Intersect just in case FIA names differ slightly
+    sp <- sort(intersect(unique(treeNames()$Species), Species))
     updateCheckboxGroupInput(session, "species_selected", choices = sp, selected = sp)
   }, ignoreInit = FALSE)
 
   observeEvent(input$selectAll, {
     req(treeNames())
-    updateCheckboxGroupInput(session, "species_selected", selected = sort(unique(treeNames()$Species)))
+    sp <- sort(intersect(unique(treeNames()$Species), Species))
+    updateCheckboxGroupInput(session, "species_selected", selected = sp)
   })
 
   observeEvent(input$uncheckAll, {
@@ -844,8 +862,13 @@ server <- function(input, output, session) {
   seed_points <- eventReactive(input$runClimate, {
     req(input$year, input$species_selected, treeNames())
 
-    # Make treeNames available in this scope for functions that expect it
-    treeNames <- treeNames()
+    tn <- treeNames()
+
+    # Critical: functions defined outside server() won't see tn unless we put it where they look.
+    assign("treeNames", tn, envir = .GlobalEnv)
+    assign("treeNames", tn, envir = environment(getClimate))
+    assign("treeNames", tn, envir = environment(getNorm))
+    assign("treeNames", tn, envir = environment(getSeeds))
 
     yr <- as.integer(input$year)
     sp <- sort(input$species_selected)
@@ -864,6 +887,7 @@ server <- function(input, output, session) {
 
     seeds <- getSeeds(anom)
 
+    # You said coordinates are already corrected: X/Y are lon/lat
     list(seeds = seeds, year = yr)
   }, ignoreInit = TRUE)
 
