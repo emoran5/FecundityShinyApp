@@ -29,7 +29,7 @@ ui <- fluidPage(
   sidebarLayout(
     sidebarPanel(
       actionButton("runClimate", "Get Forecasts", class = "btn-primary"),
-      sliderInput("year", "Select Year:", min = 1990, max = 2020, value = 2010, sep = "", step = 1,
+      sliderInput("year", "Select Year:", min = 1990, max = 2025, value = 2022, sep = "", step = 1,
                   animate = animationOptions(interval = 1500, loop = FALSE)),
       checkboxInput("compareYears", "Compare All Years", value = FALSE),
       checkboxGroupInput("species_selected", "Select Species for Map:", choices = character(0)),
@@ -53,7 +53,8 @@ get_prism_data <- function(month,
                            region = "us",
                            dataset = c("AN", "LT"),
                            keep_zip = FALSE,
-                           overwrite = FALSE) {
+                           overwrite = FALSE,
+                           cache_dir = tools::R_user_dir("fecundity_prism_rasters", which = "cache")) {
 
   if (!requireNamespace("httr", quietly = TRUE)) {
     stop("Package 'httr' is required. Install it with install.packages('httr').", call. = FALSE)
@@ -72,6 +73,21 @@ get_prism_data <- function(month,
   if (is.na(year)  || year  < 1895L) stop("'year' must be >= 1895.", call. = FALSE)
 
   yyyymm <- sprintf("%04d%02d", year, month)
+
+  # --- Check persistent raster cache first to avoid re-downloading ---
+  if (!is.null(cache_dir)) {
+    dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+    cached_tif <- file.path(cache_dir,
+                            sprintf("prism_%s_%s_%s_%s_%s.tif", variable, region, resolution, dataset, yyyymm))
+    if (file.exists(cached_tif) && !overwrite) {
+      r_file <- terra::rast(cached_tif)
+      vals   <- terra::values(r_file, mat = TRUE)
+      r_mem  <- terra::rast(r_file)
+      terra::values(r_mem) <- vals
+      names(r_mem) <- names(r_file)
+      return(r_mem)
+    }
+  }
 
   # Temp directory that will be removed at function exit
   out_dir <- file.path(tempdir(), sprintf("prism_%s_%s_%s_%s_%s",
@@ -142,6 +158,11 @@ get_prism_data <- function(month,
   # ---- load into memory so temp files can be deleted safely ----
   r_file <- terra::rast(tif_path)
 
+  # Save to persistent cache before temp dir is deleted
+  if (!is.null(cache_dir)) {
+    tryCatch(terra::writeRaster(r_file, cached_tif, overwrite = TRUE), error = function(e) NULL)
+  }
+
   # Force read values and rebuild an in-memory raster (no on-disk dependency)
   vals <- terra::values(r_file, mat = TRUE)  # works for 1+ layers
   r_mem <- terra::rast(r_file)
@@ -158,7 +179,8 @@ get_prism_normals_data <- function(mon = NULL,
                                    region = c("us","ak"),
                                    normals_end_year = 2020,
                                    keep_zip = FALSE,
-                                   overwrite = FALSE) {
+                                   overwrite = FALSE,
+                                   cache_dir = tools::R_user_dir("fecundity_prism_rasters", which = "cache")) {
 
   if (!requireNamespace("httr", quietly = TRUE)) {
     stop("Package 'httr' is required. Install it with install.packages('httr').", call. = FALSE)
@@ -189,6 +211,21 @@ get_prism_normals_data <- function(mon = NULL,
   }
 
   zip_name <- sprintf("prism_%s_%s_%s_%s_avg_30y.zip", variable, region, res_code, date_tag)
+
+  # --- Check persistent raster cache first ---
+  if (!is.null(cache_dir)) {
+    dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+    cached_tif <- file.path(cache_dir, sub("\\.zip$", ".tif", zip_name))
+    if (file.exists(cached_tif) && !overwrite) {
+      message("Cache hit: ", basename(cached_tif))
+      r_file <- terra::rast(cached_tif)
+      vals   <- terra::values(r_file, mat = TRUE)
+      r_mem  <- terra::rast(r_file)
+      terra::values(r_mem) <- vals
+      names(r_mem) <- names(r_file)
+      return(r_mem)
+    }
+  }
 
   # Build URL like:
   # https://data.prism.oregonstate.edu/normals/us/4km/ppt/monthly/prism_ppt_us_25m_202002_avg_30y.zip  [oai_citation:4‡Oregon State Data Portal](https://data.prism.oregonstate.edu/normals/us/4km/ppt/monthly/)
@@ -240,6 +277,12 @@ get_prism_normals_data <- function(mon = NULL,
 
   # Load + force into memory so temp files can be deleted safely
   r_file <- terra::rast(tif_path)
+
+  # Save to persistent cache before temp dir is deleted
+  if (!is.null(cache_dir)) {
+    tryCatch(terra::writeRaster(r_file, cached_tif, overwrite = TRUE), error = function(e) NULL)
+  }
+
   vals   <- terra::values(r_file, mat = TRUE)
   r_mem  <- terra::rast(r_file)
   terra::values(r_mem) <- vals
@@ -259,374 +302,136 @@ get_prism_normals_data <- function(mon = NULL,
 # c. more useful is probably to add lat / long of area and define size of AOI (how many square kilometers)
 # change 1. and 2. to be features related to the AOI so historical species-level seed production for that AOI and 2025 quantile for each species
 
-getClimate <- function(species, year) {
-  # function takes a parameter table x that lists taxa, reproductive phase + climate variable (temp or ppt)
-  # also includes months for the climate variable and year - i variable
-  
-  trees <- filter(treeNames, Species %in% Species) # filter for just species of interest
-  
-  tree_sf <- sf::st_as_sf(trees, coords = c("UTMx", "UTMy")) # turn data frame into a spatial object
-  
-  tcrs <- "+proj=longlat +datum=WGS84"
-  sf::st_crs(tree_sf) <- tcrs
-  tree_vec <- terra::vect(tree_sf) # convert tree file to spatial vector
-  
-  library(prism)
-  path <- tempdir() # creates temp directory to store data during the session
-  prism_set_dl_dir(path)
-  
-  # load parameter table here and filter by specified species
-  # let's make a table to live inside the function; easier to do this way
-  #####
-  pine_params <- data.frame(Taxa = c(replicate(9, "Pinus ponderosa"),
-                                  replicate(9, "Pinus jeffreyi"),
-                                  replicate(9, "Pinus contorta"),
-                                  replicate(9, "Pinus lambertiana"),
-                                  replicate(9, "Pinus monticola")),
-                          Phase = c("temp_budInit", 
-                                    "temp_Poll", 
-                                    "temp_Fert",
-                                    "ppt_budInit",
-                                    "ppt_budInit",
-                                    "ppt_Poll",
-                                    "ppt_Poll",
-                                    "ppt_Fert",
-                                    "ppt_Fert"),
-                          Time = c(-2, -1, 0,
-                                   -3, -2, 
-                                   -2, -1,
-                                   -1, 0))
+# ---- shared helper: build the full phase-params table --------------------
+# (used by both getClimate and getNorm to look up months/lags per phase)
+build_params_table <- function() {
+  pine_params <- data.frame(
+    Taxa  = rep(c("Pinus ponderosa","Pinus jeffreyi","Pinus contorta",
+                  "Pinus lambertiana","Pinus monticola"), each = 9),
+    Phase = rep(c("temp_budInit","temp_Poll","temp_Fert",
+                  "ppt_budInit","ppt_budInit","ppt_Poll","ppt_Poll",
+                  "ppt_Fert","ppt_Fert"), times = 5),
+    Time  = rep(c(-2,-1,0,-3,-2,-2,-1,-1,0), times = 5)
+  )
+  pine_params$Month <- rep(list(
+    7:11, 3:9, 4:11, 10:12, 1:4, 10:12, 1:4, 10:12, 1:4
+  ), times = 5)
 
-  pine_params$Month <- list(as.numeric(7:11), 
-                          as.numeric(3:9), 
-                          as.numeric(4:11),
-                          as.numeric(10:12), 
-                          as.numeric(1:4), 
-                          as.numeric(10:12), 
-                          as.numeric(1:4), 
-                          as.numeric(10:12), 
-                          as.numeric(1:4))
+  agrifolia_params <- data.frame(
+    Taxa  = rep("Quercus agrifolia", 10),
+    Phase = c("temp_budInit","temp_budInit","temp_Poll","temp_Fert",
+              "ppt_budInit","ppt_budInit","ppt_Poll","ppt_Poll",
+              "ppt_Fert","ppt_Fert"),
+    Time  = c(-1,0,0,0,-2,-1,-1,0,-1,0)
+  )
+  agrifolia_params$Month <- list(
+    6:10, 3:5, 4:6, 5:7, 10:12, 1:4, 10:12, 1:4, 10:12, 1:4
+  )
 
-  agrifolia_params <- data.frame(Taxa = c(replicate(10, "Quercus agrifolia")),
-                                  
-                          Phase = c("temp_budInit", 
-                                    "temp_budInit", 
-                                    "temp_Poll", 
-                                    "temp_Fert",
-                                    "ppt_budInit", "ppt_budInit",
-                                    "ppt_Poll", "ppt_Poll",
-                                    "ppt_Fert", "ppt_Fert"),
-                          
-                          Time = c(c(-1, 0, 0, 0,
-                                   -2, -1, -1, 0, -1, 0)))
+  oak_params <- data.frame(
+    Taxa  = rep(c("Quercus kelloggii","Quercus chrysolepis"), each = 10),
+    Phase = rep(c("temp_budInit","temp_budInit","temp_Poll","temp_Fert",
+                  "ppt_budInit","ppt_budInit","ppt_Poll","ppt_Poll",
+                  "ppt_Fert","ppt_Fert"), times = 2),
+    Time  = rep(c(-2,-1,-1,-1,-3,-2,-2,-1,-1,0), times = 2)
+  )
+  oak_params$Month <- rep(list(
+    6:10, 3:5, 4:6, 5:7, 10:12, 1:4, 10:12, 1:4, 10:12, 1:4
+  ), times = 2)
 
-  agrifolia_params$Month <- list(as.numeric(6:10), 
-                               as.numeric(3:5),
-                               as.numeric(4:6), 
-                               as.numeric(5:7),
-                               as.numeric(10:12), 
-                               as.numeric(1:4), 
-                               as.numeric(10:12), 
-                               as.numeric(1:4), 
-                               as.numeric(10:12), 
-                               as.numeric(1:4))
+  fir_params <- data.frame(
+    Taxa  = rep(c("Abies magnifica","Abies grandis","Abies concolor"), each = 10),
+    Phase = rep(c("temp_budInit","temp_budInit","temp_Poll","temp_Fert",
+                  "ppt_budInit","ppt_budInit","ppt_Poll","ppt_Poll",
+                  "ppt_Fert","ppt_Fert"), times = 3),
+    Time  = rep(c(-1,0,0,0,-2,-1,-1,0,0,0), times = 3)
+  )
+  fir_params$Month <- rep(list(
+    4:11, 4, 3:6, 5:9, 10:12, 1:4, 10:12, 1:4, 10:12, 1:4
+  ), times = 3)
 
-
-
-  oak_params <- data.frame(Taxa = c(replicate(10, "Quercus kelloggii"),
-                                  replicate(10, "Quercus chrysolepis")),
-                         
-                         Phase = c("temp_budInit", 
-                                    "temp_budInit", 
-                                    "temp_Poll", 
-                                    "temp_Fert",
-                                    "ppt_budInit", "ppt_budInit",
-                                    "ppt_Poll", "ppt_Poll",
-                                    "ppt_Fert", "ppt_Fert"),
-                         
-                         Time =  c(-2, -1, -1, -1,
-                                                -3, -2, -2, -1, -1, 0))
-
-  oak_params$Month <- list(as.numeric(6:10), 
-                               as.numeric(3:5),
-                               as.numeric(4:6), 
-                               as.numeric(5:7),
-                               as.numeric(10:12), 
-                               as.numeric(1:4), 
-                               as.numeric(10:12), 
-                               as.numeric(1:4), 
-                               as.numeric(10:12), 
-                               as.numeric(1:4))
-
-  fir_params <- data.frame(Taxa = c(replicate(10, "Abies magnifica"),
-                                  replicate(10, "Abies grandis"),
-                                  replicate(10, "Abies concolor")),
-                         
-                         Phase = c("temp_budInit", 
-                                    "temp_budInit", 
-                                    "temp_Poll", 
-                                    "temp_Fert",
-                                    "ppt_budInit", "ppt_budInit",
-                                    "ppt_Poll", "ppt_Poll",
-                                    "ppt_Fert", "ppt_Fert"),
-                         
-                         Time =  c(-1, 0, 0, 0,
-                                   -2, -1, -1, 0, 0, 0))
-
-  fir_params$Month <- list(as.numeric(4:11), 
-                               as.numeric(4),
-                               as.numeric(3:6), 
-                               as.numeric(5:9),
-                               as.numeric(10:12), 
-                               as.numeric(1:4), 
-                               as.numeric(10:12), 
-                               as.numeric(1:4), 
-                               as.numeric(10:12), 
-                               as.numeric(1:4))
-
-  all_params <- rbind(pine_params, agrifolia_params, oak_params, fir_params)
-  
-##### 
-  # now process the data in a big loop
-  results <- data.frame(NULL)
-  params <- filter(all_params, Taxa %in% Taxa)
-  
-  for(i in 1:nrow(params)) {
-    p <- params[i, ]
-    
-    phase <- p$Phase # let's isolate the specific phase we are running this for
-    mon <- as.numeric(unlist(p$Month)) # isolate the months of climate data
-  
-    var <- ifelse(grepl("temp", phase) == TRUE, "tmean", "ppt") # selector depending on phase
-    time <- p$Time + year # set the year to get data as year for fecundity prediction + time in past
-    temp <- data.frame(NULL)
-
-    v <- list()
-    
-    for(i in mon) {
-    v[[i]] <- get_prism_data(month = i, year = year, variable = var, resolution = "4km")
-    }
-    
-    v <- v[vapply(v, function(x) inherits(x, "SpatRaster") && terra::nlyr(x) > 0, logical(1))]
-  
-  EXT <- lapply(v, terra::extract, y = tree_vec, xy = TRUE, bind = TRUE) # extract climate data for each FIA tree
-
-  names(EXT) <- paste(mon, time, sep = "_")
-
-  EXT_df <- lapply(EXT, as.data.frame) %>%
-    lapply(. ,dplyr::rename, Value = 4) %>%
-    do.call(rbind, .) %>%
-    mutate(Variable = var) %>%
-    group_by() %>%
-    mutate(Year = year, Phase = phase) %>%
-    drop_na()
-
-
-  out <<- EXT_df %>%
-    group_by(Species, TREE_ID) %>%
-    mutate(Value = ifelse(var == "tmean", mean(Value), sum(Value)), Phase = phase) %>%
-    ungroup() %>%
-    dplyr::select(Species, TREE_ID, Year, Value, Phase) %>%
-    distinct()
-  
-  # NEED TO ADD IN HERE THE CLIMATE NORMALS TOO
-  
-  results <- rbind(results, out)
-  }
-  
-  output <<- results %>%
-    group_by(Species, TREE_ID, Year, Phase) %>%
-    mutate(Value = ifelse(Phase %in% c("ppt_budInit", "ppt_Fert", "ppt_Poll"), sum(Value), mean(Value))) %>%
-    ungroup() %>%
-    distinct()
-  
+  rbind(pine_params, agrifolia_params, oak_params, fir_params)
 }
 
-# write function to get the anomalies
-getNorm <- function(Species, year) {
-  # function takes a parameter table x that lists taxa, reproductive phase + climate variable (temp or ppt)
-  # also includes months for the climate variable and year - i variable
-  
-  trees <- filter(treeNames, Species %in% Species) 
-  
-  tree_sf <- st::st_as_sf(trees, coords = c("UTMx", "UTMy")) # turn data frame into a spatial object
-  
-  
-  tcrs <- "+proj=longlat +datum=WGS84"
-  sf::st_crs(tree_sf) <- tcrs
-  tree_vec <- terra::vect(tree_sf) # convert tree file to spatial vector
-  
-  
-  # load parameter table here and filter by specified species
-  # let's make a table to live inside the function; easier to do this way
-  #####
-  pine_params <- data.frame(Taxa = c(replicate(9, "Pinus ponderosa"),
-                                  replicate(9, "Pinus jeffreyi"),
-                                  replicate(9, "Pinus contorta"),
-                                  replicate(9, "Pinus lambertiana"),
-                                  replicate(9, "Pinus monticola")),
-                          Phase = c("temp_budInit", 
-                                    "temp_Poll", 
-                                    "temp_Fert",
-                                    "ppt_budInit",
-                                    "ppt_budInit",
-                                    "ppt_Poll",
-                                    "ppt_Poll",
-                                    "ppt_Fert",
-                                    "ppt_Fert"),
-                          Time = c(-2, -1, 0,
-                                   -3, -2, 
-                                   -2, -1,
-                                   -1, 0))
+# ---- fast getClimate: table lookup, no raster I/O -----------------------
+# Requires CLIM_MONTHLY to be loaded in the calling environment or .GlobalEnv.
+# CLIM_MONTHLY columns: TREE_ID, year, month, tmean, ppt
+getClimate <- function(species, year,
+                       clim_table = get("CLIM_MONTHLY", envir = .GlobalEnv)) {
+  trees  <- dplyr::filter(treeNames, Species %in% species) |>
+    dplyr::select(Species, TREE_ID) |> dplyr::distinct()
 
-  pine_params$Month <- list(as.numeric(7:11), 
-                          as.numeric(3:9), 
-                          as.numeric(4:11),
-                          as.numeric(10:12), 
-                          as.numeric(1:4), 
-                          as.numeric(10:12), 
-                          as.numeric(1:4), 
-                          as.numeric(10:12), 
-                          as.numeric(1:4))
+  params <- dplyr::filter(build_params_table(), Taxa %in% species)
+  ppt_phases <- c("ppt_budInit", "ppt_Fert", "ppt_Poll")
 
-  agrifolia_params <- data.frame(Taxa = c(replicate(10, "Quercus agrifolia")),
-                                  
-                          Phase = c("temp_budInit", 
-                                    "temp_budInit", 
-                                    "temp_Poll", 
-                                    "temp_Fert",
-                                    "ppt_budInit", "ppt_budInit",
-                                    "ppt_Poll", "ppt_Poll",
-                                    "ppt_Fert", "ppt_Fert"),
-                          
-                          Time = c(c(-1, 0, 0, 0,
-                                   -2, -1, -1, 0, -1, 0)))
+  rows <- vector("list", nrow(params))
+  for (i in seq_len(nrow(params))) {
+    p      <- params[i, ]
+    phase  <- p$Phase
+    mon    <- as.integer(unlist(p$Month))
+    var    <- if (grepl("temp", phase)) "tmean" else "ppt"
+    lag_yr <- as.integer(p$Time) + year
 
-  agrifolia_params$Month <- list(as.numeric(6:10), 
-                               as.numeric(3:5),
-                               as.numeric(4:6), 
-                               as.numeric(5:7),
-                               as.numeric(10:12), 
-                               as.numeric(1:4), 
-                               as.numeric(10:12), 
-                               as.numeric(1:4), 
-                               as.numeric(10:12), 
-                               as.numeric(1:4))
-
-
-
-  oak_params <- data.frame(Taxa = c(replicate(10, "Quercus kelloggii"),
-                                  replicate(10, "Quercus chrysolepis")),
-                         
-                         Phase = c("temp_budInit", 
-                                    "temp_budInit", 
-                                    "temp_Poll", 
-                                    "temp_Fert",
-                                    "ppt_budInit", "ppt_budInit",
-                                    "ppt_Poll", "ppt_Poll",
-                                    "ppt_Fert", "ppt_Fert"),
-                         
-                         Time =  c(-2, -1, -1, -1,
-                                                -3, -2, -2, -1, -1, 0))
-
-  oak_params$Month <- list(as.numeric(6:10), 
-                               as.numeric(3:5),
-                               as.numeric(4:6), 
-                               as.numeric(5:7),
-                               as.numeric(10:12), 
-                               as.numeric(1:4), 
-                               as.numeric(10:12), 
-                               as.numeric(1:4), 
-                               as.numeric(10:12), 
-                               as.numeric(1:4))
-
-  fir_params <- data.frame(Taxa = c(replicate(10, "Abies magnifica"),
-                                  replicate(10, "Abies grandis"),
-                                  replicate(10, "Abies concolor")),
-                         
-                         Phase = c("temp_budInit", 
-                                    "temp_budInit", 
-                                    "temp_Poll", 
-                                    "temp_Fert",
-                                    "ppt_budInit", "ppt_budInit",
-                                    "ppt_Poll", "ppt_Poll",
-                                    "ppt_Fert", "ppt_Fert"),
-                         
-                         Time =  c(-1, 0, 0, 0,
-                                   -2, -1, -1, 0, 0, 0))
-
-  fir_params$Month <- list(as.numeric(4:11), 
-                               as.numeric(4),
-                               as.numeric(3:6), 
-                               as.numeric(5:9),
-                               as.numeric(10:12), 
-                               as.numeric(1:4), 
-                               as.numeric(10:12), 
-                               as.numeric(1:4), 
-                               as.numeric(10:12), 
-                               as.numeric(1:4))
-
-  all_params <- rbind(pine_params, agrifolia_params, oak_params, fir_params)
-  
-##### 
-  # now process the data in a big loop
-  results <- data.frame(NULL)
-  params <- filter(all_params, Taxa %in% Taxa)
-  
-  for(i in 1:nrow(params)) {
-    p <- params[i, ]
-    
-    phase <- p$Phase # let's isolate the specific phase we are running this for
-    mon <- as.numeric(unlist(p$Month)) # isolate the months of climate data
-  
-    var <- ifelse(grepl("temp", phase) == TRUE, "tmean", "ppt") # selector depending on phase
-    time <- p$Time + year # set the year to get data as year for fecundity prediction + time in past
-    temp <- data.frame(NULL)
-  
-    v <- list()
-        
-    for(i in mon) {
-    v[[i]] <- get_prism_normals_data(mon = i, variable = var, resolution = "4km", region = "us")
-    }
-
-    v <- v[vapply(v, function(x) inherits(x, "SpatRaster") && terra::nlyr(x) > 0, logical(1))]
-  
-  EXT <- lapply(v, terra::extract, y = tree_vec, xy = TRUE, bind = TRUE) # extract climate data for each FIA tree
-
-    
-  EXT_df <- lapply(EXT, as.data.frame) %>%
-    lapply(. ,dplyr::rename, Value = 4) %>%
-    do.call(rbind, .) %>%
-    mutate(Variable = var) %>%
-    group_by() %>%
-    mutate(Year = year, Phase = phase) %>%
-    drop_na()
-
-
-  out <<- EXT_df %>%
-    group_by(Species, TREE_ID) %>%
-    mutate(Value = ifelse(var == "tmean", mean(Value), sum(Value)), Phase = phase) %>%
-    ungroup() %>%
-    dplyr::select(Species, TREE_ID, Year, Value, Phase) %>%
-    distinct()
-
-  
-  results <- rbind(results, out)
+    rows[[i]] <- clim_table |>
+      dplyr::filter(TREE_ID %in% trees$TREE_ID,
+                    .data$year == lag_yr,
+                    month %in% mon) |>
+      dplyr::left_join(trees, by = "TREE_ID") |>
+      dplyr::group_by(Species, TREE_ID) |>
+      dplyr::summarize(
+        Value = if (var == "tmean") mean(.data[["tmean"]], na.rm = TRUE)
+                else                sum(.data[["ppt"]],   na.rm = TRUE),
+        .groups = "drop"
+      ) |>
+      dplyr::mutate(Year = year, Phase = phase)
   }
-  
-  d <<- trees %>%
-    dplyr::select(Species, TREE_ID, Diameter) %>%
-    dplyr::rename(Value = Diameter) %>%
-    drop_na() %>%
-    mutate(Phase = "diam", Year = year)
-  
-  output_norm <<- results %>%
-    group_by(Species, TREE_ID, Year, Phase) %>%
-    mutate(Value = ifelse(Phase %in% c("ppt_budInit", "ppt_Fert", "ppt_Poll"), sum(Value), mean(Value))) %>%
-    ungroup() %>%
-    distinct() %>%
-    rename(normValue = Value) 
-  
+
+  dplyr::bind_rows(rows) |>
+    dplyr::group_by(Species, TREE_ID, Year, Phase) |>
+    dplyr::summarize(
+      Value = if (Phase[1] %in% ppt_phases) sum(Value) else mean(Value),
+      .groups = "drop"
+    ) |>
+    dplyr::distinct()
+}
+
+# ---- fast getNorm: table lookup, no raster I/O --------------------------
+# Requires NORM_MONTHLY to be loaded in the calling environment or .GlobalEnv.
+# NORM_MONTHLY columns: TREE_ID, month, tmean, ppt
+getNorm <- function(species, year,
+                    norm_table = get("NORM_MONTHLY", envir = .GlobalEnv)) {
+  trees  <- dplyr::filter(treeNames, Species %in% species) |>
+    dplyr::select(Species, TREE_ID) |> dplyr::distinct()
+
+  params <- dplyr::filter(build_params_table(), Taxa %in% species)
+  ppt_phases <- c("ppt_budInit", "ppt_Fert", "ppt_Poll")
+
+  rows <- vector("list", nrow(params))
+  for (i in seq_len(nrow(params))) {
+    p     <- params[i, ]
+    phase <- p$Phase
+    mon   <- as.integer(unlist(p$Month))
+    var   <- if (grepl("temp", phase)) "tmean" else "ppt"
+
+    rows[[i]] <- norm_table |>
+      dplyr::filter(TREE_ID %in% trees$TREE_ID, month %in% mon) |>
+      dplyr::left_join(trees, by = "TREE_ID") |>
+      dplyr::group_by(Species, TREE_ID) |>
+      dplyr::summarize(
+        normValue = if (var == "tmean") mean(.data[["tmean"]], na.rm = TRUE)
+                    else                sum(.data[["ppt"]],    na.rm = TRUE),
+        .groups = "drop"
+      ) |>
+      dplyr::mutate(Year = year, Phase = phase)
+  }
+
+  dplyr::bind_rows(rows) |>
+    dplyr::group_by(Species, TREE_ID, Year, Phase) |>
+    dplyr::summarize(
+      normValue = if (Phase[1] %in% ppt_phases) sum(normValue) else mean(normValue),
+      .groups = "drop"
+    ) |>
+    dplyr::distinct()
 }
 
 # calculate fecundity
@@ -637,11 +442,11 @@ getFecundity <- function(Species) {
   for(i in Species) {
 
   if(grepl("Pinus", i) == TRUE)  {
-    cpath <- 'https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/Pinus_model1_f5_betas.csv' # need to change these to the github link
+    cpath <- '~/Desktop/MASTIF cone tool/Pinus_model1_f5_betas.csv'
   } else if(grepl("Quercus", i) == TRUE) {
-    cpath <- 'https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/Quercus_model1_f4_betas.csv'
+    cpath <- '~/Desktop/MASTIF cone tool/Quercus_model1_f4_betas.csv'
   } else if(grepl("Abies", i) == TRUE) {
-    cpath <- 'https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/Abies_model2_f2_betas.csv'
+    cpath <- '~/Desktop/MASTIF cone tool/Abies_model2_f2_betas.csv'
   }
   
   c <- read.csv(cpath) %>%
@@ -676,10 +481,12 @@ getFecundity <- function(Species) {
   mutate(beta_obs = estimate, interaction = ifelse(var2 != "none", paste(var1, var2, sep = ":"), var1)) %>%
   dplyr::select(Species, interaction, beta_obs) %>%
   pivot_wider(names_from = interaction, values_from = beta_obs)
+
+  # Accumulate inside loop so all genera are retained
+  coefs <- rbind(coefs, c) %>% distinct()
   }
   
-  coefs <<- rbind(coefs, c) %>%
-    distinct()
+  coefs
   
 }
 
@@ -723,50 +530,59 @@ getSeeds <- function(data) {
   
 } else if(i %in% c("Quercus agrifolia", "Quercus kelloggii", "Quercus chrysolepis")) {
   
-    output2$Seeds <<- beta$Intercept +
-      beta$diam * data$diam +
-      beta$`I(diam^2)` * data$diam +
-      beta$precip_budInit * data$ppt_budInit +
-      beta$`diam:precip_budInit` * data$diam * data$ppt_budInit +
-      beta$temp_budInit * data$temp_budInit +
-      beta$`I(temp_budInit^2)` * data$temp_budInit +
-      beta$`diam:temp_budInit` * data$diam * data$temp_budInit +
-      beta$ppt_Poll * data$ppt_Poll +
-      beta$`diam:ppt_Poll` * data$diam * data$ppt_Poll +
-      beta$tmean_Poll * data$temp_Poll +
-      beta$`I(tmean_Poll^2)` * data$temp_Poll +
-      beta$`diam:tmean_Poll` * data$diam * data$temp_Poll +
-      beta$ppt_Fert * data$ppt_Fert +
-      beta$`diam:ppt_Fert` * data$diam * data$ppt_Fert +
-      beta$tmean_Fert * data$temp_Fert +
-      beta$`I(tmean_Fert^2)` * data$temp_Fert +
-      beta$`diam:tmean_Fert` * data$diam * data$temp_Fert
+    output2$Seeds <- beta_new$Intercept +
+      beta_new$diam * data_new$diam +
+      beta_new$`I(diam^2)` * data_new$diam +
+      beta_new$precip_budInit * data_new$ppt_budInit +
+      beta_new$`diam:precip_budInit` * data_new$diam * data_new$ppt_budInit +
+      beta_new$temp_budInit * data_new$temp_budInit +
+      beta_new$`I(temp_budInit^2)` * data_new$temp_budInit +
+      beta_new$`diam:temp_budInit` * data_new$diam * data_new$temp_budInit +
+      beta_new$ppt_Poll * data_new$ppt_Poll +
+      beta_new$`diam:ppt_Poll` * data_new$diam * data_new$ppt_Poll +
+      beta_new$tmean_Poll * data_new$temp_Poll +
+      beta_new$`I(tmean_Poll^2)` * data_new$temp_Poll +
+      beta_new$`diam:tmean_Poll` * data_new$diam * data_new$temp_Poll +
+      beta_new$ppt_Fert * data_new$ppt_Fert +
+      beta_new$`diam:ppt_Fert` * data_new$diam * data_new$ppt_Fert +
+      beta_new$tmean_Fert * data_new$temp_Fert +
+      beta_new$`I(tmean_Fert^2)` * data_new$temp_Fert +
+      beta_new$`diam:tmean_Fert` * data_new$diam * data_new$temp_Fert
     
 } else if(i %in% c("Abies grandis", "Abies magnifica", "Abies concolor")) {
   
-    output2$Seeds <<- beta$Intercept +
-      beta$diam * data$diam +
-      beta$`I(diam^2)` * data$diam +
-      beta$precip_budInit * data$ppt_budInit +
-      beta$`I(precip_budInit^2)` * data$ppt_budInit +
-      beta$`diam:precip_budInit` * data$diam * data$ppt_budInit +
-      beta$temp_budInit * data$temp_budInit +
-      beta$`I(temp_budInit^2)` * data$temp_budInit +
-      beta$`diam:temp_budInit` * data$diam * data$temp_budInit +
-      beta$ppt_Poll * data$ppt_Poll +
-      beta$`I(ppt_Poll^2)` * data$ppt_Poll +
-      beta$`diam:ppt_Poll` * data$diam * data$ppt_Poll +
-      beta$tmean_Poll * data$temp_Poll +
-      beta$`I(tmean_Poll^2)` * data$temp_Poll +
-      beta$`diam:tmean_Poll` * data$diam * data$temp_Poll +
-      beta$tmean_Fert * data$temp_Fert +
-      beta$`I(tmean_Fert^2)` * data$temp_Fert +
-      beta$`diam:tmean_Fert` * data$diam * data$temp_Fert
+    output2$Seeds <- beta_new$Intercept +
+      beta_new$diam * data_new$diam +
+      beta_new$`I(diam^2)` * data_new$diam +
+      beta_new$precip_budInit * data_new$ppt_budInit +
+      beta_new$`I(precip_budInit^2)` * data_new$ppt_budInit +
+      beta_new$`diam:precip_budInit` * data_new$diam * data_new$ppt_budInit +
+      beta_new$temp_budInit * data_new$temp_budInit +
+      beta_new$`I(temp_budInit^2)` * data_new$temp_budInit +
+      beta_new$`diam:temp_budInit` * data_new$diam * data_new$temp_budInit +
+      beta_new$ppt_Poll * data_new$ppt_Poll +
+      beta_new$`I(ppt_Poll^2)` * data_new$ppt_Poll +
+      beta_new$`diam:ppt_Poll` * data_new$diam * data_new$ppt_Poll +
+      beta_new$tmean_Poll * data_new$temp_Poll +
+      beta_new$`I(tmean_Poll^2)` * data_new$temp_Poll +
+      beta_new$`diam:tmean_Poll` * data_new$diam * data_new$temp_Poll +
+      beta_new$tmean_Fert * data_new$temp_Fert +
+      beta_new$`I(tmean_Fert^2)` * data_new$temp_Fert +
+      beta_new$`diam:tmean_Fert` * data_new$diam * data_new$temp_Fert
     
 }
     
-    results <<- rbind(results, output2)
+    results <- rbind(results, output2)
   }
+
+  # Join tree coordinates for mapping
+  coords <- treeNames |>
+    dplyr::ungroup() |>
+    dplyr::select(Species, TREE_ID, UTMx, UTMy) |>
+    dplyr::distinct() |>
+    dplyr::rename(X = UTMx, Y = UTMy)
+
+  results |> dplyr::left_join(coords, by = c("Species", "TREE_ID"))
 }
 
 # Jim did interpolate between measurement dates - assume DBH stays the same until the next measurement
@@ -775,20 +591,28 @@ getSeeds <- function(data) {
 
 ```{r server}
 library(shiny)
-library(cachem)
-library(memoise)
 library(dplyr)
 library(tidyr)
 library(leaflet)
 
-PRISM_CACHE_DIR <- tools::R_user_dir("fecundity_prism", which = "cache")
-dir.create(PRISM_CACHE_DIR, recursive = TRUE, showWarnings = FALSE)
-PRISM_CACHE <- cachem::cache_disk(dir = PRISM_CACHE_DIR)
+# Fast path: load pre-extracted lookup tables if precompute_climate.R has been run.
+# Fallback: use per-species-year file cache saved from previous raster-extraction runs.
+CLIM_MONTHLY_PATH <- "~/Desktop/MASTIF cone tool/clim_monthly.rds"
+NORM_MONTHLY_PATH <- "~/Desktop/MASTIF cone tool/norm_monthly.rds"
+CLIM_MONTHLY <- if (file.exists(CLIM_MONTHLY_PATH)) readRDS(CLIM_MONTHLY_PATH) else NULL
+NORM_MONTHLY <- if (file.exists(NORM_MONTHLY_PATH)) readRDS(NORM_MONTHLY_PATH) else NULL
+
+# Per-species-year file cache (populated by previous raster-extraction runs).
+RESULT_CACHE_DIR <- tools::R_user_dir("fecundity_results", which = "cache")
+dir.create(RESULT_CACHE_DIR, recursive = TRUE, showWarnings = FALSE)
+
+.load_cached <- function(prefix, sp, yr) {
+  key  <- paste0(prefix, "_", paste(sort(sp), collapse = "__"), "_", yr, ".rds")
+  path <- file.path(RESULT_CACHE_DIR, key)
+  if (file.exists(path)) readRDS(path) else NULL
+}
 
 server <- function(input, output, session) {
-
-  getClimate_cached <- memoise::memoise(getClimate, cache = PRISM_CACHE)
-  getNorm_cached    <- memoise::memoise(getNorm,    cache = PRISM_CACHE)
 
   # ---- your defined Species list (used to filter treeNames + UI options) ----
   Species <- sort(c(
@@ -807,31 +631,7 @@ server <- function(input, output, session) {
 
   # ---- build treeNames (FIA) once per session ----
   treeNames <- reactive({
-    plot.list <- read.csv("https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/FIA/CA_PLOT.csv") %>%
-      dplyr::rename(Plot = 4, Unit = 2, County = 3, STATE = 1, UTMy = 5, UTMx = 6) %>%
-      tidyr::unite(Plot, Plot, Unit, County, STATE, sep = "_") %>%
-      dplyr::distinct()
-
-    tree.list <- read.csv("https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/FIA/CA_TREE.csv") %>%
-      dplyr::rename(Year = INVYR, Plot = PLOT, Unit = UNITCD, County = COUNTYCD, STATE = STATECD,
-                    Subplot = SUBP, Tree = TREE, Diameter = DIA, SPCD = SPCD,
-                    SHADE = CLIGHTCD, canopy = CCLCD) %>%
-      tidyr::unite(Plot, Plot, Unit, County, STATE, sep = "_") %>%
-      dplyr::distinct()
-
-    PLOT_TREE <- dplyr::left_join(plot.list, tree.list)
-
-    sp_names <- read.csv("https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/FIA/SPC_ID.csv") %>%
-      dplyr::select(SPCD, SCI_NAME)
-
-    merge(PLOT_TREE, sp_names) %>%
-      dplyr::rename(Species = SCI_NAME) %>%
-      dplyr::group_by(Species, Plot, Subplot, Tree) %>%
-      dplyr::filter(Year == max(Year)) %>%
-      dplyr::select(Species, Plot, Subplot, Tree, UTMx, UTMy, Diameter) %>%
-      dplyr::distinct() %>%
-      tidyr::unite("TREE_ID", c(Plot, Subplot, Tree), sep = "_") %>%
-      dplyr::filter(Species %in% Species)  # <-- filter to your defined list
+    readRDS("/Users/deedeehuebner/Desktop/MASTIF cone tool/treeNames.rds")
   })
 
   # ---- species choices (filtered to your Species list) ----
@@ -858,69 +658,102 @@ server <- function(input, output, session) {
       setView(lng = -119.418, lat = 36.778, zoom = 5)
   })
 
-  # ---- PRISM + getSeeds on click ----
+  # ---- compute forecasts on click ----
   seed_points <- eventReactive(input$runClimate, {
     req(input$year, input$species_selected, treeNames())
+    message("DEBUG 1: req passed")
 
     tn <- treeNames()
-
-    # Critical: functions defined outside server() won't see tn unless we put it where they look.
     assign("treeNames", tn, envir = .GlobalEnv)
-    assign("treeNames", tn, envir = environment(getClimate))
-    assign("treeNames", tn, envir = environment(getNorm))
     assign("treeNames", tn, envir = environment(getSeeds))
 
-    yr <- as.integer(input$year)
+    yr <- as.numeric(input$year)
     sp <- sort(input$species_selected)
     validate(need(length(sp) > 0, "Select at least one species."))
+    message("DEBUG 2: yr=", yr, " sp=", paste(sp, collapse=","))
 
-    output$statusText <- renderText("Running PRISM downloads + computing forecasts...")
+    if (!is.null(CLIM_MONTHLY) && !is.null(NORM_MONTHLY)) {
+      message("DEBUG 3a: fast path")
+      clim_out <- getClimate(sp, yr)
+      norm_out <- getNorm(sp, yr)
+    } else {
+      message("DEBUG 3b: file cache path")
+      clim_out <- .load_cached("clim", sp, yr)
+      norm_out  <- .load_cached("norm", sp, yr)
+      message("DEBUG 4: clim_out null=", is.null(clim_out), " norm_out null=", is.null(norm_out))
+      if (is.null(clim_out) || is.null(norm_out)) {
+        output$statusText <- renderText(paste0(
+          "No cached data for: ", paste(sp, collapse=", "), " (", yr, "). ",
+          "Only Pinus ponderosa 2022 is available. Select that combination or run precompute_climate.R."
+        ))
+        return(NULL)
+      }
+    }
 
-    clim_out <- getClimate_cached(sp, yr)
-    norm_out <- getNorm_cached(sp, yr)
+    message("DEBUG 5: building anom")
+    anom <- merge(clim_out, norm_out) |>
+      dplyr::mutate(Value = Value - normValue) |>
+      dplyr::select(Species, TREE_ID, Year, Phase, Value) |>
+      tidyr::pivot_wider(names_from = Phase, values_from = Value) |>
+      tidyr::drop_na() |>
+      dplyr::left_join(
+        tn |> dplyr::select(Species, TREE_ID, Diameter) |> dplyr::distinct(),
+        by = c("Species", "TREE_ID")
+      ) |>
+      dplyr::rename(diam = Diameter)
+    message("DEBUG 6: anom rows=", nrow(anom))
 
-    anom <- merge(clim_out, norm_out) %>%
-      mutate(Value = Value - normValue) %>%
-      select(Species, TREE_ID, Year, Phase, Value) %>%
-      pivot_wider(names_from = Phase, values_from = Value) %>%
-      drop_na()
-
+    message("DEBUG 7: running getSeeds")
     seeds <- getSeeds(anom)
+    message("DEBUG 8: seeds rows=", nrow(seeds))
 
-    # You said coordinates are already corrected: X/Y are lon/lat
     list(seeds = seeds, year = yr)
   }, ignoreInit = TRUE)
 
   observeEvent(seed_points(), {
+    tryCatch({
     res <- seed_points()
     seeds <- res$seeds
     yr <- res$year
 
-    validate(need(!is.null(seeds) && nrow(seeds) > 0, "No results returned for this selection."))
+    if (is.null(seeds) || nrow(seeds) == 0) {
+      output$statusText <- renderText("Error: getSeeds returned no rows.")
+      return()
+    }
+
+    output$statusText <- renderText(paste("seeds columns:", paste(names(seeds), collapse=", ")))
 
     value_col <- dplyr::case_when(
+      "Seeds"        %in% names(seeds) ~ "Seeds",
       "logF_current" %in% names(seeds) ~ "logF_current",
       "fecundity"    %in% names(seeds) ~ "fecundity",
       "Value"        %in% names(seeds) ~ "Value",
       TRUE ~ NA_character_
     )
-    validate(need(!is.na(value_col), "No value column found (expected logF_current/fecundity/Value)."))
-    validate(need(all(c("X","Y") %in% names(seeds)), "Expected X and Y columns for mapping."))
+    if (is.na(value_col)) {
+      output$statusText <- renderText(paste("Error: no value column. names:", paste(names(seeds), collapse=", ")))
+      return()
+    }
+    if (!all(c("X","Y") %in% names(seeds))) {
+      output$statusText <- renderText(paste("Error: missing X/Y. names:", paste(names(seeds), collapse=", ")))
+      return()
+    }
 
-    pal <- leaflet::colorNumeric(c("red", "blue"), seeds[[value_col]])
+    vals <- seeds[[value_col]]
+    pal  <- leaflet::colorNumeric(c("red", "blue"), vals)
 
     leafletProxy("map", data = seeds) %>%
       clearMarkers() %>%
       clearControls() %>%
       addCircleMarkers(
         lng = ~X, lat = ~Y, radius = 3,
-        color = ~pal(.data[[value_col]]),
+        color = pal(vals),
         opacity = 0.8,
         popup = ~paste0(
           "<b>Species:</b> ", Species, "<br>",
           "<b>Tree:</b> ", TREE_ID, "<br>",
           "<b>Year:</b> ", yr, "<br>",
-          "<b>Predicted:</b> ", round(.data[[value_col]], 3)
+          "<b>Predicted:</b> ", round(get(value_col), 3)
         )
       ) %>%
       addLegend("bottomright", pal = pal, values = seeds[[value_col]],
@@ -930,6 +763,9 @@ server <- function(input, output, session) {
       paste("Last run:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
             "Year:", yr, "Points:", nrow(seeds))
     )
+    }, error = function(e) {
+      output$statusText <- renderText(paste("Error:", conditionMessage(e)))
+    })
   }, ignoreInit = TRUE)
 
   output$statusText <- renderText({
