@@ -373,10 +373,11 @@ getClimate <- function(species, year,
     lag_yr <- as.integer(p$Time) + year
 
     rows[[i]] <- clim_table |>
-      dplyr::filter(TREE_ID %in% trees$TREE_ID,
+      dplyr::filter(Species %in% trees$Species,
+                    TREE_ID %in% trees$TREE_ID,
                     .data$year == lag_yr,
                     month %in% mon) |>
-      dplyr::left_join(trees, by = "TREE_ID") |>
+      dplyr::left_join(trees, by = c("Species", "TREE_ID")) |>
       dplyr::group_by(Species, TREE_ID) |>
       dplyr::summarize(
         Value = if (var == "tmean") mean(.data[["tmean"]], na.rm = TRUE)
@@ -414,8 +415,10 @@ getNorm <- function(species, year,
     var   <- if (grepl("temp", phase)) "tmean" else "ppt"
 
     rows[[i]] <- norm_table |>
-      dplyr::filter(TREE_ID %in% trees$TREE_ID, month %in% mon) |>
-      dplyr::left_join(trees, by = "TREE_ID") |>
+      dplyr::filter(Species %in% trees$Species,
+                    TREE_ID %in% trees$TREE_ID,
+                    month %in% mon) |>
+      dplyr::left_join(trees, by = c("Species", "TREE_ID")) |>
       dplyr::group_by(Species, TREE_ID) |>
       dplyr::summarize(
         normValue = if (var == "tmean") mean(.data[["tmean"]], na.rm = TRUE)
@@ -614,6 +617,8 @@ dir.create(RESULT_CACHE_DIR, recursive = TRUE, showWarnings = FALSE)
 
 server <- function(input, output, session) {
 
+  status_msg <- reactiveVal("Select a year and species, then click 'Get Forecasts'.")
+
   # ---- your defined Species list (used to filter treeNames + UI options) ----
   Species <- sort(c(
     "Pinus ponderosa",
@@ -661,7 +666,6 @@ server <- function(input, output, session) {
   # ---- compute forecasts on click ----
   seed_points <- eventReactive(input$runClimate, {
     req(input$year, input$species_selected, treeNames())
-    message("DEBUG 1: req passed")
 
     tn <- treeNames()
     assign("treeNames", tn, envir = .GlobalEnv)
@@ -670,27 +674,24 @@ server <- function(input, output, session) {
     yr <- as.numeric(input$year)
     sp <- sort(input$species_selected)
     validate(need(length(sp) > 0, "Select at least one species."))
-    message("DEBUG 2: yr=", yr, " sp=", paste(sp, collapse=","))
+    status_msg("Computing forecasts...")
 
     if (!is.null(CLIM_MONTHLY) && !is.null(NORM_MONTHLY)) {
-      message("DEBUG 3a: fast path")
-      clim_out <- getClimate(sp, yr)
-      norm_out <- getNorm(sp, yr)
+      clim_out <- getClimate(sp, yr, clim_table = CLIM_MONTHLY)
+      norm_out <- getNorm(sp, yr, norm_table = NORM_MONTHLY)
     } else {
-      message("DEBUG 3b: file cache path")
       clim_out <- .load_cached("clim", sp, yr)
       norm_out  <- .load_cached("norm", sp, yr)
-      message("DEBUG 4: clim_out null=", is.null(clim_out), " norm_out null=", is.null(norm_out))
       if (is.null(clim_out) || is.null(norm_out)) {
-        output$statusText <- renderText(paste0(
+        status_msg(paste0(
           "No cached data for: ", paste(sp, collapse=", "), " (", yr, "). ",
-          "Only Pinus ponderosa 2022 is available. Select that combination or run precompute_climate.R."
+          "Run precompute_climate.R to enable all species/years."
         ))
         return(NULL)
       }
     }
 
-    message("DEBUG 5: building anom")
+
     anom <- merge(clim_out, norm_out) |>
       dplyr::mutate(Value = Value - normValue) |>
       dplyr::select(Species, TREE_ID, Year, Phase, Value) |>
@@ -701,27 +702,22 @@ server <- function(input, output, session) {
         by = c("Species", "TREE_ID")
       ) |>
       dplyr::rename(diam = Diameter)
-    message("DEBUG 6: anom rows=", nrow(anom))
-
-    message("DEBUG 7: running getSeeds")
     seeds <- getSeeds(anom)
-    message("DEBUG 8: seeds rows=", nrow(seeds))
 
     list(seeds = seeds, year = yr)
   }, ignoreInit = TRUE)
 
-  observeEvent(seed_points(), {
+  observeEvent(seed_points(), ignoreNULL = TRUE, {
     tryCatch({
     res <- seed_points()
+    if (is.null(res)) return()
     seeds <- res$seeds
     yr <- res$year
 
     if (is.null(seeds) || nrow(seeds) == 0) {
-      output$statusText <- renderText("Error: getSeeds returned no rows.")
+      status_msg("Error: getSeeds returned no rows.")
       return()
     }
-
-    output$statusText <- renderText(paste("seeds columns:", paste(names(seeds), collapse=", ")))
 
     value_col <- dplyr::case_when(
       "Seeds"        %in% names(seeds) ~ "Seeds",
@@ -731,11 +727,11 @@ server <- function(input, output, session) {
       TRUE ~ NA_character_
     )
     if (is.na(value_col)) {
-      output$statusText <- renderText(paste("Error: no value column. names:", paste(names(seeds), collapse=", ")))
+      status_msg(paste("Error: no value column. names:", paste(names(seeds), collapse=", ")))
       return()
     }
     if (!all(c("X","Y") %in% names(seeds))) {
-      output$statusText <- renderText(paste("Error: missing X/Y. names:", paste(names(seeds), collapse=", ")))
+      status_msg(paste("Error: missing X/Y. names:", paste(names(seeds), collapse=", ")))
       return()
     }
 
@@ -759,18 +755,14 @@ server <- function(input, output, session) {
       addLegend("bottomright", pal = pal, values = seeds[[value_col]],
                 title = "Predicted", opacity = 1)
 
-    output$statusText <- renderText(
-      paste("Last run:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
-            "Year:", yr, "Points:", nrow(seeds))
-    )
+    status_msg(paste("Last run:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+                     "| Year:", yr, "| Points:", nrow(seeds)))
     }, error = function(e) {
-      output$statusText <- renderText(paste("Error:", conditionMessage(e)))
+      status_msg(paste("Error:", conditionMessage(e)))
     })
-  }, ignoreInit = TRUE)
+  }, ignoreInit = FALSE)
 
-  output$statusText <- renderText({
-    "Select a year and species, then click 'Get Forecasts'."
-  })
+  output$statusText <- renderText(status_msg())
 }
 ```
 
