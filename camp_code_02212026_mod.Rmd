@@ -29,7 +29,7 @@ ui <- fluidPage(
   sidebarLayout(
     sidebarPanel(
       actionButton("runClimate", "Get Forecasts", class = "btn-primary"),
-      sliderInput("year", "Select Year:", min = 1990, max = 2025, value = 2022, sep = "", step = 1,
+      sliderInput("year", "Select Year:", min = 2005, max = 2025, value = 2022, sep = "", step = 1,
                   animate = animationOptions(interval = 1500, loop = FALSE)),
       checkboxInput("compareYears", "Compare All Years", value = FALSE),
       checkboxGroupInput("species_selected", "Select Species for Map:", choices = character(0)),
@@ -357,8 +357,9 @@ build_params_table <- function() {
 # Requires CLIM_MONTHLY to be loaded in the calling environment or .GlobalEnv.
 # CLIM_MONTHLY columns: TREE_ID, year, month, tmean, ppt
 getClimate <- function(species, year,
-                       clim_table = get("CLIM_MONTHLY", envir = .GlobalEnv)) {
-  trees  <- dplyr::filter(treeNames, Species %in% species) |>
+                       clim_table  = get("CLIM_MONTHLY",  envir = .GlobalEnv),
+                       tree_names  = get("treeNames",     envir = .GlobalEnv)) {
+  trees  <- dplyr::filter(tree_names, Species %in% species) |>
     dplyr::select(Species, TREE_ID) |> dplyr::distinct()
 
   params <- dplyr::filter(build_params_table(), Taxa %in% species)
@@ -400,8 +401,9 @@ getClimate <- function(species, year,
 # Requires NORM_MONTHLY to be loaded in the calling environment or .GlobalEnv.
 # NORM_MONTHLY columns: TREE_ID, month, tmean, ppt
 getNorm <- function(species, year,
-                    norm_table = get("NORM_MONTHLY", envir = .GlobalEnv)) {
-  trees  <- dplyr::filter(treeNames, Species %in% species) |>
+                    norm_table  = get("NORM_MONTHLY", envir = .GlobalEnv),
+                    tree_names  = get("treeNames",    envir = .GlobalEnv)) {
+  trees  <- dplyr::filter(tree_names, Species %in% species) |>
     dplyr::select(Species, TREE_ID) |> dplyr::distinct()
 
   params <- dplyr::filter(build_params_table(), Taxa %in% species)
@@ -439,62 +441,61 @@ getNorm <- function(species, year,
 
 # calculate fecundity
 getFecundity <- function(Species) {
-  
-  coefs <- data.frame(NULL)
-  
-  for(i in Species) {
 
-  if(grepl("Pinus", i) == TRUE)  {
-    cpath <- '~/Desktop/MASTIF cone tool/Pinus_model1_f5_betas.csv'
-  } else if(grepl("Quercus", i) == TRUE) {
-    cpath <- '~/Desktop/MASTIF cone tool/Quercus_model1_f4_betas.csv'
-  } else if(grepl("Abies", i) == TRUE) {
-    cpath <- '~/Desktop/MASTIF cone tool/Abies_model2_f2_betas.csv'
-  }
-  
-  c <- read.csv(cpath) %>%
-  mutate(X = gsub("species", "", X)) %>%
-  separate(X, c('Species', 'var1', 'var2'), sep = ":") %>%
-  mutate(var1 = ifelse(is.na(var1) == TRUE, "Intercept", var1), var2 = ifelse(is.na(var2) == TRUE, "none", var2)) %>%
-    filter(var1 != "shade", var2 != "shade") %>%
-  mutate(Species = ifelse(Species == "quercusChrysole", 
-                          "Quercus chrysolepis",
-                          ifelse(Species == "quercusKelloggi", 
-                                 "Quercus kelloggii", 
-                                 ifelse(Species == "quercusAgrifoli", 
-                                        "Quercus agrifolia",
-                                        ifelse(Species == "pinusContorta", 
-                                               "Pinus contorta", 
-                                               ifelse(Species == "pinusJeffreyi", 
-                                                      "Pinus jeffreyi", 
-                                                      ifelse(Species == "pinusLamberti", 
-                                                             "Pinus lambertiana", 
-                                                             ifelse(Species == "pinusMonticol", 
-                                                                    "Pinus monticola",
-                                                                    ifelse(Species == "pinusPonderos", 
-                                                                           "Pinus ponderosa", 
-                                                                           ifelse(Species == "abiesConcolor", 
-                                                                                  "Abies concolor", 
-                                                                                  ifelse(Species == "abiesMagnific", 
-                                                                                         "Abies magnifica",
-                                                                                         ifelse(Species == "abiesGrandis", 
-                                                                                                "Abies grandis",
-                                                                                                NA)))))))))))) %>%
-    drop_na() %>%
-  mutate(beta_obs = estimate, interaction = ifelse(var2 != "none", paste(var1, var2, sep = ":"), var1)) %>%
-  dplyr::select(Species, interaction, beta_obs) %>%
-  pivot_wider(names_from = interaction, values_from = beta_obs)
+  sp_name_map <- c(
+    quercusChrysole = "Quercus chrysolepis",
+    quercusKelloggi = "Quercus kelloggii",
+    quercusAgrifoli = "Quercus agrifolia",
+    pinusContorta   = "Pinus contorta",
+    pinusJeffreyi   = "Pinus jeffreyi",
+    pinusLamberti   = "Pinus lambertiana",
+    pinusMonticol   = "Pinus monticola",
+    pinusPonderos   = "Pinus ponderosa",
+    abiesConcolor   = "Abies concolor",
+    abiesMagnific   = "Abies magnifica",
+    abiesGrandis    = "Abies grandis"
+  )
 
-  # Accumulate inside loop so all genera are retained
-  coefs <- rbind(coefs, c) %>% distinct()
-  }
-  
-  coefs
-  
+  # Read each genus CSV only once, then combine with bind_rows
+  genera <- unique(sub(" .*", "", Species))
+
+  coefs_list <- lapply(genera, function(genus) {
+    cpath <- if (genus == "Pinus") {
+      'https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/Pinus_model1_f5_betas.csv'
+    } else if (genus == "Quercus") {
+      'https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/Quercus_model1_f4_betas.csv'
+    } else if (genus == "Abies") {
+      'https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/Abies_model2_f2_betas.csv'
+    } else {
+      stop(paste("Unknown genus:", genus))
+    }
+
+    read.csv(cpath) %>%
+      mutate(X = gsub("species", "", X)) %>%
+      separate(X, c('Species', 'var1', 'var2'), sep = ":", fill = "right") %>%
+      mutate(
+        var1 = ifelse(is.na(var1), "Intercept", var1),
+        var2 = ifelse(is.na(var2), "none",      var2)
+      ) %>%
+      filter(var1 != "shade", var2 != "shade") %>%
+      mutate(Species = dplyr::recode(Species, !!!sp_name_map)) %>%
+      drop_na() %>%
+      mutate(
+        beta_obs    = estimate,
+        interaction = ifelse(var2 != "none", paste(var1, var2, sep = ":"), var1)
+      ) %>%
+      dplyr::select(Species, interaction, beta_obs) %>%
+      # values_fn = first prevents list-columns when duplicate interactions exist
+      pivot_wider(names_from = interaction, values_from = beta_obs,
+                  values_fn = first)
+  })
+
+  dplyr::bind_rows(coefs_list)
+
 }
 
 
-getSeeds <- function(data) {
+getSeeds <- function(data, tree_data) {
   Spec <- unique(data$Species)
   
   coefs <- getFecundity(Spec)
@@ -506,11 +507,34 @@ getSeeds <- function(data) {
   
   for(i in Spec) {
     
-    output2 <- filter(output, Species == i)
+    output2  <- filter(output, Species == i)
     beta_new <- filter(coefs, Species == i)
     data_new <- filter(data, Species == i)
+
+    # Fill any coefficient column absent from this species' model with 0.
+    # (Missing column -> predictor not used in model -> zero contribution.)
+    all_beta_cols <- c(
+      "Intercept", "diam", "I(diam^2)",
+      "precip_budInit", "I(precip_budInit^2)", "diam:precip_budInit",
+      "temp_budInit",   "I(temp_budInit^2)",   "diam:temp_budInit",
+      "ppt_Poll",       "I(ppt_Poll^2)",        "diam:ppt_Poll",
+      "tmean_Poll",     "I(tmean_Poll^2)",      "diam:tmean_Poll",
+      "ppt_Fert",       "diam:ppt_Fert",
+      "tmean_Fert",     "I(tmean_Fert^2)",      "diam:tmean_Fert"
+    )
+    for (col in all_beta_cols) {
+      if (!col %in% names(beta_new) || is.na(beta_new[[col]])) beta_new[[col]] <- 0
+    }
     
   
+  # Baseline: intercept + diameter terms only (all climate anomalies = 0).
+  # Seeds - baseline = log change in fecundity due to climate (unitless, comparable across species).
+  # NOTE: quadratic coefficient names (e.g. I(diam^2)) reflect how MASTIF built its design matrix;
+  # the predictors were already squared before model fitting, so we do NOT re-square them here.
+  Seeds_baseline <- beta_new$Intercept +
+    beta_new$diam        * data_new$diam +
+    beta_new$`I(diam^2)` * data_new$diam
+
   if(i %in% c("Pinus ponderosa", "Pinus jeffreyi", "Pinus contorta", "Pinus lambertiana", "Pinus monticola")) {
 
     output2$Seeds <- beta_new$Intercept +
@@ -530,6 +554,7 @@ getSeeds <- function(data) {
       beta_new$`diam:tmean_Fert` * data_new$diam * data_new$temp_Fert +
       beta_new$`diam:ppt_Poll` * data_new$diam * data_new$ppt_Poll +
       beta_new$`diam:ppt_Fert` * data_new$diam * data_new$ppt_Fert
+    output2$Seeds <- output2$Seeds - Seeds_baseline
   
 } else if(i %in% c("Quercus agrifolia", "Quercus kelloggii", "Quercus chrysolepis")) {
   
@@ -551,6 +576,7 @@ getSeeds <- function(data) {
       beta_new$tmean_Fert * data_new$temp_Fert +
       beta_new$`I(tmean_Fert^2)` * data_new$temp_Fert +
       beta_new$`diam:tmean_Fert` * data_new$diam * data_new$temp_Fert
+    output2$Seeds <- output2$Seeds - Seeds_baseline
     
 } else if(i %in% c("Abies grandis", "Abies magnifica", "Abies concolor")) {
   
@@ -572,6 +598,7 @@ getSeeds <- function(data) {
       beta_new$tmean_Fert * data_new$temp_Fert +
       beta_new$`I(tmean_Fert^2)` * data_new$temp_Fert +
       beta_new$`diam:tmean_Fert` * data_new$diam * data_new$temp_Fert
+    output2$Seeds <- output2$Seeds - Seeds_baseline
     
 }
     
@@ -579,7 +606,7 @@ getSeeds <- function(data) {
   }
 
   # Join tree coordinates for mapping
-  coords <- treeNames |>
+  coords <- tree_data |>
     dplyr::ungroup() |>
     dplyr::select(Species, TREE_ID, UTMx, UTMy) |>
     dplyr::distinct() |>
@@ -600,6 +627,7 @@ library(leaflet)
 
 # Fast path: load pre-extracted lookup tables if precompute_climate.R has been run.
 # Fallback: use per-species-year file cache saved from previous raster-extraction runs.
+# If using local computer directory update as needed.
 CLIM_MONTHLY_PATH <- "~/Desktop/MASTIF cone tool/clim_monthly.rds"
 NORM_MONTHLY_PATH <- "~/Desktop/MASTIF cone tool/norm_monthly.rds"
 CLIM_MONTHLY <- if (file.exists(CLIM_MONTHLY_PATH)) readRDS(CLIM_MONTHLY_PATH) else NULL
@@ -635,6 +663,7 @@ server <- function(input, output, session) {
   ))
 
   # ---- build treeNames (FIA) once per session ----
+  #change directory to your own
   treeNames <- reactive({
     readRDS("/Users/deedeehuebner/Desktop/MASTIF cone tool/treeNames.rds")
   })
@@ -668,8 +697,6 @@ server <- function(input, output, session) {
     req(input$year, input$species_selected, treeNames())
 
     tn <- treeNames()
-    assign("treeNames", tn, envir = .GlobalEnv)
-    assign("treeNames", tn, envir = environment(getSeeds))
 
     yr <- as.numeric(input$year)
     sp <- sort(input$species_selected)
@@ -677,8 +704,8 @@ server <- function(input, output, session) {
     status_msg("Computing forecasts...")
 
     if (!is.null(CLIM_MONTHLY) && !is.null(NORM_MONTHLY)) {
-      clim_out <- getClimate(sp, yr, clim_table = CLIM_MONTHLY)
-      norm_out <- getNorm(sp, yr, norm_table = NORM_MONTHLY)
+      clim_out <- getClimate(sp, yr, clim_table = CLIM_MONTHLY, tree_names = tn)
+      norm_out <- getNorm(sp, yr, norm_table = NORM_MONTHLY,   tree_names = tn)
     } else {
       clim_out <- .load_cached("clim", sp, yr)
       norm_out  <- .load_cached("norm", sp, yr)
@@ -702,7 +729,8 @@ server <- function(input, output, session) {
         by = c("Species", "TREE_ID")
       ) |>
       dplyr::rename(diam = Diameter)
-    seeds <- getSeeds(anom)
+    seeds <- getSeeds(anom, tn) |>
+      dplyr::mutate(Seeds = log(abs(Seeds) + 1) * sign(Seeds))
 
     list(seeds = seeds, year = yr)
   }, ignoreInit = TRUE)
@@ -735,9 +763,9 @@ server <- function(input, output, session) {
       return()
     }
 
+    seeds <- seeds[!is.na(seeds[[value_col]]), ]
     vals <- seeds[[value_col]]
-    pal  <- leaflet::colorNumeric(c("red", "blue"), vals)
-
+    pal  <- leaflet::colorNumeric(c("red", "blue"),vals, reverse = FALSE)
     leafletProxy("map", data = seeds) %>%
       clearMarkers() %>%
       clearControls() %>%
@@ -752,8 +780,8 @@ server <- function(input, output, session) {
           "<b>Predicted:</b> ", round(get(value_col), 3)
         )
       ) %>%
-      addLegend("bottomright", pal = pal, values = seeds[[value_col]],
-                title = "Predicted", opacity = 1)
+      addLegend("bottomright", pal = pal, values = vals,
+                title = "Log \u0394 Fecundity", opacity = 1)
 
     status_msg(paste("Last run:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
                      "| Year:", yr, "| Points:", nrow(seeds)))
