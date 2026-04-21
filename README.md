@@ -1,6 +1,6 @@
 # CaMP: California Mast Prediction Tool
 
-CaMP is an interactive Shiny application for predicting tree seed production (mast) across California. It uses PRISM climate data extracted at Forest Inventory and Analysis (FIA) tree locations and species-specific fecundity models from the MASTIF framework to produce spatial forecasts of log Δ fecundity for 11 conifer and oak species.
+CaMP is an interactive Shiny application for predicting tree seed production (mast) across California. It uses PRISM climate data extracted at Forest Inventory and Analysis (FIA) tree locations and species-specific fecundity models from the MASTIF framework to produce spatial forecasts of log fecundity for 11 conifer and oak species.
 
 ---
 
