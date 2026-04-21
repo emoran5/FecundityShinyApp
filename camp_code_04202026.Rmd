@@ -1,0 +1,1196 @@
+---
+title: "CaMP: California Mast Prediction Tool"
+output: html_document
+date: "2024-10-01"
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+# Load necessary libraries
+library(shiny)
+library(shinyWidgets)
+library(leaflet)
+library(dplyr)
+library(readr)
+library(showtext)
+library(tidyr)
+library(plotly)
+
+# Add Google Font and enable showtext
+font_add_google("Montserrat", "MS")
+showtext_auto()
+```
+
+```{r ui}
+library(shinycssloaders)
+ui <- fluidPage(
+  # Custom message handler: disable/re-enable a single radio button option
+  tags$script(HTML("
+    Shiny.addCustomMessageHandler('toggleRadioOption', function(msg) {
+      var radio = document.querySelector(
+        '#' + msg.inputId + ' input[value=\"' + msg.value + '\"]'
+      );
+      if (!radio) return;
+      radio.disabled = msg.disabled;
+      var lbl = radio.closest('div.radio') || radio.parentElement;
+      lbl.style.color  = msg.disabled ? '#555' : '';
+      lbl.style.cursor = msg.disabled ? 'not-allowed' : '';
+      lbl.title        = msg.disabled ? msg.tooltip : '';
+    });
+  ")),
+  setBackgroundColor("black"),
+  tags$h1("California Mast Prediction Tool", style = "color: white; font-family: 'MS'"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      actionButton("runClimate", "Get Forecasts", class = "btn-primary"),
+      sliderInput("year", "Select Year:", min = 2005, max = 2026, value = 2022, sep = "", step = 1,
+                  animate = animationOptions(interval = 1500, loop = FALSE)),
+      checkboxInput("compareYears", "Compare All Years", value = FALSE),
+      checkboxGroupInput("species_selected", "Select Species for Map:", choices = character(0)),
+      actionButton("selectAll", "Select All Species"),
+      actionButton("uncheckAll", "Uncheck All Species"),
+      hr(style = "border-color: #555; margin-top: 14px;"),
+      tags$h5("Climate Scenario", style = "color: #cccccc; margin-bottom: 4px;"),
+      radioButtons("climate_mode", label = NULL,
+        choices = c("Use Current Forecast" = "observed",
+                    "Use Custom Scenario"   = "scenario"),
+        selected = "observed"
+      ),
+      conditionalPanel(
+        condition = "input.climate_mode == 'scenario'",
+        conditionalPanel(
+          condition = "input.year != 2026",
+          tags$p("Departures are relative to 30-year normals.",
+                 style = "color: #aaa; font-size: 11px; margin-bottom: 6px;")
+        ),
+        conditionalPanel(
+          condition = "input.year == 2026",
+          tags$p("Departures are relative to the 2025 climate forecast.",
+                 style = "color: #f0c060; font-size: 11px; margin-bottom: 6px;")
+        ),
+        sliderInput("temp_departure",
+          label   = "Temperature Departure (%):",
+          min = -50, max = 50, value = 0, step = 5, ticks = TRUE
+        ),
+        sliderInput("ppt_departure",
+          label   = "Precipitation Departure (%):",
+          min = -50, max = 50, value = 0, step = 5, ticks = TRUE
+        ),
+        checkboxInput("compare_observed",
+          label = "Overlay current forecast",
+          value = FALSE
+        )
+      )
+    ),
+    mainPanel(
+      # Map + inset overlay container
+      div(
+        style = "position: relative; height: 600px;",
+        withSpinner(leafletOutput("map", height = 600), type = 6),
+        # Inset map: overlaid bottom-right, only shown in compare mode
+        conditionalPanel(
+          condition = "input.climate_mode == 'scenario' && input.compare_observed",
+          tags$div(
+            style = paste(
+              "position: absolute; top: 10px; right: 10px;",
+              "width: 230px; height: 230px; z-index: 1000;",
+              "background: rgba(0,0,0,0.88); border: 2px solid #888;",
+              "border-radius: 4px; overflow: hidden;"
+            ),
+            tags$div(
+              style = paste(
+                "color: white; font-size: 11px; font-weight: bold;",
+                "text-align: center; padding: 3px;",
+                "background: rgba(255,255,255,0.08); letter-spacing: 0.5px;"
+              ),
+              conditionalPanel(
+                condition = "input.year == 2026",
+                "2025 FORECAST (BASELINE)"
+              ),
+              conditionalPanel(
+                condition = "input.year != 2026",
+                "CURRENT FORECAST"
+              )
+            ),
+            leafletOutput("inset_map", height = "205px")
+          )
+        )
+      ),
+      # Scatter plot: only shown in compare mode
+      conditionalPanel(
+        condition = "input.climate_mode == 'scenario' && input.compare_observed",
+        div(
+          style = "background: #111111; padding: 8px 4px 4px 4px; margin-top: 6px;",
+          plotlyOutput("scatter_plot", height = "320px")
+        )
+      ),
+      textOutput("statusText")
+    )
+  )
+)
+```
+
+``` {r functions}
+# testing out a new prism option
+get_prism_data <- function(month,
+                           year,
+                           variable = c("ppt","tmin","tmax","tmean","tdmean","vpdmin","vpdmax"),
+                           resolution = c("4km","800m","400m"),
+                           region = "us",
+                           dataset = c("AN", "LT"),
+                           keep_zip = FALSE,
+                           overwrite = FALSE,
+                           cache_dir = tools::R_user_dir("fecundity_prism_rasters", which = "cache")) {
+
+  if (!requireNamespace("httr", quietly = TRUE)) {
+    stop("Package 'httr' is required. Install it with install.packages('httr').", call. = FALSE)
+  }
+  if (!requireNamespace("terra", quietly = TRUE)) {
+    stop("Package 'terra' is required. Install it with install.packages('terra').", call. = FALSE)
+  }
+
+  dataset    <- match.arg(dataset)
+  resolution <- match.arg(resolution)
+  variable   <- match.arg(variable)
+
+  month <- as.integer(month)
+  year  <- as.integer(year)
+  if (is.na(month) || month < 1L || month > 12L) stop("'month' must be 1..12.", call. = FALSE)
+  if (is.na(year)  || year  < 1895L) stop("'year' must be >= 1895.", call. = FALSE)
+
+  yyyymm <- sprintf("%04d%02d", year, month)
+
+  # --- Check persistent raster cache first to avoid re-downloading ---
+  if (!is.null(cache_dir)) {
+    dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+    cached_tif <- file.path(cache_dir,
+                            sprintf("prism_%s_%s_%s_%s_%s.tif", variable, region, resolution, dataset, yyyymm))
+    if (file.exists(cached_tif) && !overwrite) {
+      r_file <- terra::rast(cached_tif)
+      vals   <- terra::values(r_file, mat = TRUE)
+      r_mem  <- terra::rast(r_file)
+      terra::values(r_mem) <- vals
+      names(r_mem) <- names(r_file)
+      return(r_mem)
+    }
+  }
+
+  # Temp directory that will be removed at function exit
+  out_dir <- file.path(tempdir(), sprintf("prism_%s_%s_%s_%s_%s",
+                                          variable, region, resolution, dataset, yyyymm))
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  on.exit({
+    if (dir.exists(out_dir)) unlink(out_dir, recursive = TRUE, force = TRUE)
+  }, add = TRUE)
+
+  url <- sprintf("https://services.nacse.org/prism/data/get/%s/%s/%s/%s",
+                 region, resolution, variable, yyyymm)
+  if (dataset == "LT") url <- paste0(url, "/lt")
+
+  zip_path <- file.path(out_dir, sprintf("prism_%s_%s_%s_%s.zip",
+                                         variable, region, resolution, yyyymm))
+  if (file.exists(zip_path) && overwrite) unlink(zip_path)
+
+  resp <- httr::GET(
+    url,
+    httr::write_disk(zip_path, overwrite = TRUE),
+    httr::user_agent("R (get_prism_data)")
+  )
+
+  # Fail fast on HTTP errors
+  httr::stop_for_status(resp)
+
+  # ---- validate we actually got a ZIP ----
+  if (!file.exists(zip_path) || is.na(file.info(zip_path)$size) || file.info(zip_path)$size < 100L) {
+    stop("Download did not create a valid file on disk.", call. = FALSE)
+  }
+
+  sig <- readBin(zip_path, what = "raw", n = 2)
+  is_zip <- length(sig) == 2 && identical(sig, charToRaw("PK"))
+  if (!is_zip) {
+    # Try to show the beginning of the server response for debugging
+    txt <- tryCatch(readLines(zip_path, warn = FALSE, n = 20), error = function(e) character())
+    snippet <- paste(txt, collapse = "\n")
+    if (nchar(snippet) > 800) snippet <- substr(snippet, 1, 800)
+    stop(
+      paste0(
+        "PRISM did not return a ZIP for this request.\n",
+        "URL: ", url, "\n\n",
+        "First part of response:\n", snippet
+      ),
+      call. = FALSE
+    )
+  }
+
+  # Now it's safe to inspect the zip
+  files_in_zip <- utils::unzip(zip_path, list = TRUE)$Name
+  tif_candidates <- files_in_zip[grepl("\\.tif$", files_in_zip, ignore.case = TRUE)]
+  if (length(tif_candidates) == 0L) {
+    stop("Downloaded ZIP did not contain a .tif file.", call. = FALSE)
+  }
+
+  utils::unzip(zip_path, exdir = out_dir, overwrite = overwrite)
+
+  tif_path <- file.path(out_dir, tif_candidates[1])
+  if (!file.exists(tif_path)) {
+    tif_found <- list.files(out_dir, pattern = "\\.tif$", recursive = TRUE, full.names = TRUE)
+    if (length(tif_found) > 0L) tif_path <- tif_found[1]
+  }
+  if (!file.exists(tif_path)) stop("Unzip succeeded but could not locate extracted .tif.", call. = FALSE)
+
+  if (!keep_zip && file.exists(zip_path)) unlink(zip_path)
+
+  # ---- load into memory so temp files can be deleted safely ----
+  r_file <- terra::rast(tif_path)
+
+  # Save to persistent cache before temp dir is deleted
+  if (!is.null(cache_dir)) {
+    tryCatch(terra::writeRaster(r_file, cached_tif, overwrite = TRUE), error = function(e) NULL)
+  }
+
+  # Force read values and rebuild an in-memory raster (no on-disk dependency)
+  vals <- terra::values(r_file, mat = TRUE)  # works for 1+ layers
+  r_mem <- terra::rast(r_file)
+  terra::values(r_mem) <- vals
+  names(r_mem) <- names(r_file)
+
+  r_mem
+}
+
+get_prism_normals_data <- function(mon = NULL,
+                                   annual = FALSE,
+                                   variable = c("ppt","tmin","tmax","tmean","tdmean","vpdmin","vpdmax"),
+                                   resolution = c("4km","800m"),
+                                   region = c("us","ak"),
+                                   normals_end_year = 2020,
+                                   keep_zip = FALSE,
+                                   overwrite = FALSE,
+                                   cache_dir = tools::R_user_dir("fecundity_prism_rasters", which = "cache")) {
+
+  if (!requireNamespace("httr", quietly = TRUE)) {
+    stop("Package 'httr' is required. Install it with install.packages('httr').", call. = FALSE)
+  }
+  if (!requireNamespace("terra", quietly = TRUE)) {
+    stop("Package 'terra' is required. Install it with install.packages('terra').", call. = FALSE)
+  }
+
+  variable   <- match.arg(variable)
+  resolution <- match.arg(resolution)
+  region     <- match.arg(region)
+
+  # Normals file naming uses PRISM resolution codes (e.g., 25m for 4km, 30s for 800m).  [oai_citation:2‡PRISM Group](https://prism.oregonstate.edu/formats)
+  res_code <- switch(resolution,
+                     "4km"  = "25m",
+                     "800m" = "30s")
+
+  # Decide temporal subfolder + filename suffix
+  if (isTRUE(annual)) {
+    temporal <- "monthly"   # annual normals live alongside monthly in PRISM normals dirs (see example listing).  [oai_citation:3‡Oregon State Data Portal](https://data.prism.oregonstate.edu/normals/us/4km/ppt/monthly/)
+    date_tag <- sprintf("%04d", as.integer(normals_end_year))
+  } else {
+    if (is.null(mon)) stop("Provide mon=1..12 for monthly normals, or set annual=TRUE.", call. = FALSE)
+    mon <- as.integer(mon)
+    if (is.na(mon) || mon < 1L || mon > 12L) stop("'mon' must be an integer 1..12.", call. = FALSE)
+    temporal <- "monthly"
+    date_tag <- sprintf("%04d%02d", as.integer(normals_end_year), mon)
+  }
+
+  zip_name <- sprintf("prism_%s_%s_%s_%s_avg_30y.zip", variable, region, res_code, date_tag)
+
+  # --- Check persistent raster cache first ---
+  if (!is.null(cache_dir)) {
+    dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+    cached_tif <- file.path(cache_dir, sub("\\.zip$", ".tif", zip_name))
+    if (file.exists(cached_tif) && !overwrite) {
+      message("Cache hit: ", basename(cached_tif))
+      r_file <- terra::rast(cached_tif)
+      vals   <- terra::values(r_file, mat = TRUE)
+      r_mem  <- terra::rast(r_file)
+      terra::values(r_mem) <- vals
+      names(r_mem) <- names(r_file)
+      return(r_mem)
+    }
+  }
+
+  # Build URL like:
+  # https://data.prism.oregonstate.edu/normals/us/4km/ppt/monthly/prism_ppt_us_25m_202002_avg_30y.zip  [oai_citation:4‡Oregon State Data Portal](https://data.prism.oregonstate.edu/normals/us/4km/ppt/monthly/)
+  url <- sprintf("https://data.prism.oregonstate.edu/normals/%s/%s/%s/%s/%s",
+                 region, resolution, variable, temporal, zip_name)
+
+  # Unique temp folder per call (Shiny-safe)
+  out_dir <- tempfile("prism_normals_")
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  on.exit({
+    if (dir.exists(out_dir)) unlink(out_dir, recursive = TRUE, force = TRUE)
+  }, add = TRUE)
+
+  zip_path <- file.path(out_dir, zip_name)
+  if (file.exists(zip_path) && overwrite) unlink(zip_path)
+
+  resp <- httr::GET(
+    url,
+    httr::write_disk(zip_path, overwrite = TRUE),
+    httr::user_agent("R (get_prism_normals_data)")
+  )
+  httr::stop_for_status(resp)
+
+  # Validate ZIP signature (avoid HTML/redirects saved as .zip)
+  sig <- readBin(zip_path, what = "raw", n = 2)
+  if (!(length(sig) == 2 && identical(sig, charToRaw("PK")))) {
+    txt <- tryCatch(readLines(zip_path, warn = FALSE, n = 20), error = function(e) character())
+    snippet <- paste(txt, collapse = "\n")
+    if (nchar(snippet) > 800) snippet <- substr(snippet, 1, 800)
+    stop(paste0("PRISM normals download did not return a ZIP.\nURL: ", url, "\n\nResponse head:\n", snippet),
+         call. = FALSE)
+  }
+
+  # Find and unzip the GeoTIFF inside
+  files_in_zip <- utils::unzip(zip_path, list = TRUE)$Name
+  tif_candidates <- files_in_zip[grepl("\\.tif$", files_in_zip, ignore.case = TRUE)]
+  if (length(tif_candidates) == 0L) stop("Downloaded ZIP did not contain a .tif file.", call. = FALSE)
+
+  utils::unzip(zip_path, exdir = out_dir, overwrite = overwrite)
+  tif_path <- file.path(out_dir, tif_candidates[1])
+
+  if (!file.exists(tif_path)) {
+    tif_found <- list.files(out_dir, pattern = "\\.tif$", recursive = TRUE, full.names = TRUE)
+    if (length(tif_found) > 0L) tif_path <- tif_found[1]
+  }
+  if (!file.exists(tif_path)) stop("Unzip succeeded but could not locate extracted .tif.", call. = FALSE)
+
+  if (!keep_zip && file.exists(zip_path)) unlink(zip_path)
+
+  # Load + force into memory so temp files can be deleted safely
+  r_file <- terra::rast(tif_path)
+
+  # Save to persistent cache before temp dir is deleted
+  if (!is.null(cache_dir)) {
+    tryCatch(terra::writeRaster(r_file, cached_tif, overwrite = TRUE), error = function(e) NULL)
+  }
+
+  vals   <- terra::values(r_file, mat = TRUE)
+  r_mem  <- terra::rast(r_file)
+  terra::values(r_mem) <- vals
+  names(r_mem) <- names(r_file)
+
+  r_mem
+}
+
+
+# need to try to run again to make sure it works but should be all set up now!
+# To do: 
+# 1. make sure this works for each tree and I can plot the data; must calculate the 2025 value as quantile and as raw # seeds
+# 2. Add option so that when you click on an area (tree until i get interpolation working) you get a graph on the bottom of distribution of seed #s for that tree to see if it's high or low
+# 3. Interpolate across 1km square grid and add option for user to define AOI:
+# a. could be upload a shapefile (probably not used much)
+# b. could be a draw function
+# c. more useful is probably to add lat / long of area and define size of AOI (how many square kilometers)
+# change 1. and 2. to be features related to the AOI so historical species-level seed production for that AOI and 2025 quantile for each species
+
+# ---- shared helper: build the full phase-params table --------------------
+# (used by both getClimate and getNorm to look up months/lags per phase)
+build_params_table <- function() {
+  pine_params <- data.frame(
+    Taxa  = rep(c("Pinus ponderosa","Pinus jeffreyi","Pinus contorta",
+                  "Pinus lambertiana","Pinus monticola"), each = 9),
+    Phase = rep(c("temp_budInit","temp_Poll","temp_Fert",
+                  "ppt_budInit","ppt_budInit","ppt_Poll","ppt_Poll",
+                  "ppt_Fert","ppt_Fert"), times = 5),
+    Time  = rep(c(-2,-1,0,-3,-2,-2,-1,-1,0), times = 5)
+  )
+  pine_params$Month <- rep(list(
+    7:11, 3:9, 4:11, 10:12, 1:4, 10:12, 1:4, 10:12, 1:4
+  ), times = 5)
+
+  agrifolia_params <- data.frame(
+    Taxa  = rep("Quercus agrifolia", 10),
+    Phase = c("temp_budInit","temp_budInit","temp_Poll","temp_Fert",
+              "ppt_budInit","ppt_budInit","ppt_Poll","ppt_Poll",
+              "ppt_Fert","ppt_Fert"),
+    Time  = c(-1,0,0,0,-2,-1,-1,0,-1,0)
+  )
+  agrifolia_params$Month <- list(
+    6:10, 3:5, 4:6, 5:7, 10:12, 1:4, 10:12, 1:4, 10:12, 1:4
+  )
+
+  oak_params <- data.frame(
+    Taxa  = rep(c("Quercus kelloggii","Quercus chrysolepis"), each = 10),
+    Phase = rep(c("temp_budInit","temp_budInit","temp_Poll","temp_Fert",
+                  "ppt_budInit","ppt_budInit","ppt_Poll","ppt_Poll",
+                  "ppt_Fert","ppt_Fert"), times = 2),
+    Time  = rep(c(-2,-1,-1,-1,-3,-2,-2,-1,-1,0), times = 2)
+  )
+  oak_params$Month <- rep(list(
+    6:10, 3:5, 4:6, 5:7, 10:12, 1:4, 10:12, 1:4, 10:12, 1:4
+  ), times = 2)
+
+  fir_params <- data.frame(
+    Taxa  = rep(c("Abies magnifica","Abies grandis","Abies concolor"), each = 10),
+    Phase = rep(c("temp_budInit","temp_budInit","temp_Poll","temp_Fert",
+                  "ppt_budInit","ppt_budInit","ppt_Poll","ppt_Poll",
+                  "ppt_Fert","ppt_Fert"), times = 3),
+    Time  = rep(c(-1,0,0,0,-2,-1,-1,0,0,0), times = 3)
+  )
+  fir_params$Month <- rep(list(
+    4:11, 4, 3:6, 5:9, 10:12, 1:4, 10:12, 1:4, 10:12, 1:4
+  ), times = 3)
+
+  rbind(pine_params, agrifolia_params, oak_params, fir_params)
+}
+
+# ---- fast getClimate: table lookup, no raster I/O -----------------------
+# Requires CLIM_MONTHLY to be loaded in the calling environment or .GlobalEnv.
+# CLIM_MONTHLY columns: TREE_ID, year, month, tmean, ppt
+getClimate <- function(species, year,
+                       clim_table  = get("CLIM_MONTHLY",  envir = .GlobalEnv),
+                       tree_names  = get("treeNames",     envir = .GlobalEnv)) {
+  trees  <- dplyr::filter(tree_names, Species %in% species) |>
+    dplyr::select(Species, TREE_ID) |> dplyr::distinct()
+
+  params <- dplyr::filter(build_params_table(), Taxa %in% species)
+  ppt_phases <- c("ppt_budInit", "ppt_Fert", "ppt_Poll")
+
+  rows <- vector("list", nrow(params))
+  for (i in seq_len(nrow(params))) {
+    p      <- params[i, ]
+    phase  <- p$Phase
+    mon    <- as.integer(unlist(p$Month))
+    var    <- if (grepl("temp", phase)) "tmean" else "ppt"
+    lag_yr <- as.integer(p$Time) + year
+
+    rows[[i]] <- clim_table |>
+      dplyr::filter(Species %in% trees$Species,
+                    TREE_ID %in% trees$TREE_ID,
+                    .data$year == lag_yr,
+                    month %in% mon) |>
+      dplyr::left_join(trees, by = c("Species", "TREE_ID")) |>
+      dplyr::group_by(Species, TREE_ID) |>
+      dplyr::summarize(
+        Value = if (var == "tmean") mean(.data[["tmean"]], na.rm = TRUE)
+                else                sum(.data[["ppt"]],   na.rm = TRUE),
+        .groups = "drop"
+      ) |>
+      dplyr::mutate(Year = year, Phase = phase)
+  }
+
+  dplyr::bind_rows(rows) |>
+    dplyr::group_by(Species, TREE_ID, Year, Phase) |>
+    dplyr::summarize(
+      Value = if (Phase[1] %in% ppt_phases) sum(Value) else mean(Value),
+      .groups = "drop"
+    ) |>
+    dplyr::distinct()
+}
+
+# ---- fast getNorm: table lookup, no raster I/O --------------------------
+# Requires NORM_MONTHLY to be loaded in the calling environment or .GlobalEnv.
+# NORM_MONTHLY columns: TREE_ID, month, tmean, ppt
+getNorm <- function(species, year,
+                    norm_table  = get("NORM_MONTHLY", envir = .GlobalEnv),
+                    tree_names  = get("treeNames",    envir = .GlobalEnv)) {
+  trees  <- dplyr::filter(tree_names, Species %in% species) |>
+    dplyr::select(Species, TREE_ID) |> dplyr::distinct()
+
+  params <- dplyr::filter(build_params_table(), Taxa %in% species)
+  ppt_phases <- c("ppt_budInit", "ppt_Fert", "ppt_Poll")
+
+  rows <- vector("list", nrow(params))
+  for (i in seq_len(nrow(params))) {
+    p     <- params[i, ]
+    phase <- p$Phase
+    mon   <- as.integer(unlist(p$Month))
+    var   <- if (grepl("temp", phase)) "tmean" else "ppt"
+
+    rows[[i]] <- norm_table |>
+      dplyr::filter(Species %in% trees$Species,
+                    TREE_ID %in% trees$TREE_ID,
+                    month %in% mon) |>
+      dplyr::left_join(trees, by = c("Species", "TREE_ID")) |>
+      dplyr::group_by(Species, TREE_ID) |>
+      dplyr::summarize(
+        normValue = if (var == "tmean") mean(.data[["tmean"]], na.rm = TRUE)
+                    else                sum(.data[["ppt"]],    na.rm = TRUE),
+        .groups = "drop"
+      ) |>
+      dplyr::mutate(Year = year, Phase = phase)
+  }
+
+  dplyr::bind_rows(rows) |>
+    dplyr::group_by(Species, TREE_ID, Year, Phase) |>
+    dplyr::summarize(
+      normValue = if (Phase[1] %in% ppt_phases) sum(normValue) else mean(normValue),
+      .groups = "drop"
+    ) |>
+    dplyr::distinct()
+}
+
+# calculate fecundity
+getFecundity <- function(Species) {
+
+  sp_name_map <- c(
+    quercusChrysole = "Quercus chrysolepis",
+    quercusKelloggi = "Quercus kelloggii",
+    quercusAgrifoli = "Quercus agrifolia",
+    pinusContorta   = "Pinus contorta",
+    pinusJeffreyi   = "Pinus jeffreyi",
+    pinusLamberti   = "Pinus lambertiana",
+    pinusMonticol   = "Pinus monticola",
+    pinusPonderos   = "Pinus ponderosa",
+    abiesConcolor   = "Abies concolor",
+    abiesMagnific   = "Abies magnifica",
+    abiesGrandis    = "Abies grandis"
+  )
+
+  # Read each genus CSV only once, then combine with bind_rows
+  genera <- unique(sub(" .*", "", Species))
+
+  coefs_list <- lapply(genera, function(genus) {
+    cpath <- if (genus == "Pinus") {
+      'https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/Pinus_model1_f5_betas.csv'
+    } else if (genus == "Quercus") {
+      'https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/Quercus_model1_f4_betas.csv'
+    } else if (genus == "Abies") {
+      'https://raw.githubusercontent.com/emoran5/FecundityShinyApp/refs/heads/main/Abies_model2_f2_betas.csv'
+    } else {
+      stop(paste("Unknown genus:", genus))
+    }
+
+    read.csv(cpath) %>%
+      mutate(X = gsub("species", "", X)) %>%
+      separate(X, c('Species', 'var1', 'var2'), sep = ":", fill = "right") %>%
+      mutate(
+        var1 = ifelse(is.na(var1), "Intercept", var1),
+        var2 = ifelse(is.na(var2), "none",      var2)
+      ) %>%
+      filter(var1 != "shade", var2 != "shade") %>%
+      mutate(Species = dplyr::recode(Species, !!!sp_name_map)) %>%
+      drop_na() %>%
+      mutate(
+        beta_obs    = estimate,
+        interaction = ifelse(var2 != "none", paste(var1, var2, sep = ":"), var1)
+      ) %>%
+      dplyr::select(Species, interaction, beta_obs) %>%
+      # values_fn = first prevents list-columns when duplicate interactions exist
+      pivot_wider(names_from = interaction, values_from = beta_obs,
+                  values_fn = first)
+  })
+
+  dplyr::bind_rows(coefs_list)
+
+}
+
+
+getSeeds <- function(data, tree_data) {
+  Spec <- unique(data$Species)
+  
+  coefs <- getFecundity(Spec)
+  
+  output <- data %>%
+    dplyr::select(Species, TREE_ID)
+  
+  results <- data.frame(NULL)
+  
+  for(i in Spec) {
+    
+    output2  <- filter(output, Species == i)
+    beta_new <- filter(coefs, Species == i)
+    data_new <- filter(data, Species == i)
+
+    # Fill any coefficient column absent from this species' model with 0.
+    # (Missing column -> predictor not used in model -> zero contribution.)
+    all_beta_cols <- c(
+      "Intercept", "diam", "I(diam^2)",
+      "precip_budInit", "I(precip_budInit^2)", "diam:precip_budInit",
+      "temp_budInit",   "I(temp_budInit^2)",   "diam:temp_budInit",
+      "ppt_Poll",       "I(ppt_Poll^2)",        "diam:ppt_Poll",
+      "tmean_Poll",     "I(tmean_Poll^2)",      "diam:tmean_Poll",
+      "ppt_Fert",       "diam:ppt_Fert",
+      "tmean_Fert",     "I(tmean_Fert^2)",      "diam:tmean_Fert"
+    )
+    for (col in all_beta_cols) {
+      if (!col %in% names(beta_new) || is.na(beta_new[[col]])) beta_new[[col]] <- 0
+    }
+    
+  
+  # Baseline: intercept + diameter terms only (all climate anomalies = 0).
+  # Seeds - baseline = log change in fecundity due to climate (unitless, comparable across species).
+  # NOTE: quadratic coefficient names (e.g. I(diam^2)) reflect how MASTIF built its design matrix;
+  # the predictors were already squared before model fitting, so we do NOT re-square them here.
+  Seeds_baseline <- beta_new$Intercept +
+    beta_new$diam        * data_new$diam +
+    beta_new$`I(diam^2)` * data_new$diam
+
+  if(i %in% c("Pinus ponderosa", "Pinus jeffreyi", "Pinus contorta", "Pinus lambertiana", "Pinus monticola")) {
+
+    output2$Seeds <- beta_new$Intercept +
+      beta_new$diam * data_new$diam +
+      beta_new$`I(diam^2)` * data_new$diam +
+      beta_new$precip_budInit * data_new$ppt_budInit +
+      beta_new$`I(precip_budInit^2)` * data_new$ppt_budInit +
+      beta_new$temp_budInit * data_new$temp_budInit +
+      beta_new$`I(temp_budInit^2)` * data_new$temp_budInit +
+      beta_new$tmean_Poll * data_new$temp_Poll +
+      beta_new$tmean_Fert * data_new$temp_Fert +
+      beta_new$ppt_Poll * data_new$ppt_Poll +
+      beta_new$ppt_Fert * data_new$ppt_Fert +
+      beta_new$`diam:precip_budInit` * data_new$diam * data_new$ppt_budInit +
+      beta_new$`diam:temp_budInit` * data_new$diam * data_new$temp_budInit +
+      beta_new$`diam:tmean_Poll` * data_new$diam * data_new$temp_Poll +
+      beta_new$`diam:tmean_Fert` * data_new$diam * data_new$temp_Fert +
+      beta_new$`diam:ppt_Poll` * data_new$diam * data_new$ppt_Poll +
+      beta_new$`diam:ppt_Fert` * data_new$diam * data_new$ppt_Fert
+    output2$Seeds <- output2$Seeds #- Seeds_baseline
+  
+} else if(i %in% c("Quercus agrifolia", "Quercus kelloggii", "Quercus chrysolepis")) {
+  
+    output2$Seeds <- beta_new$Intercept +
+      beta_new$diam * data_new$diam +
+      beta_new$`I(diam^2)` * data_new$diam +
+      beta_new$precip_budInit * data_new$ppt_budInit +
+      beta_new$`diam:precip_budInit` * data_new$diam * data_new$ppt_budInit +
+      beta_new$temp_budInit * data_new$temp_budInit +
+      beta_new$`I(temp_budInit^2)` * data_new$temp_budInit +
+      beta_new$`diam:temp_budInit` * data_new$diam * data_new$temp_budInit +
+      beta_new$ppt_Poll * data_new$ppt_Poll +
+      beta_new$`diam:ppt_Poll` * data_new$diam * data_new$ppt_Poll +
+      beta_new$tmean_Poll * data_new$temp_Poll +
+      beta_new$`I(tmean_Poll^2)` * data_new$temp_Poll +
+      beta_new$`diam:tmean_Poll` * data_new$diam * data_new$temp_Poll +
+      beta_new$ppt_Fert * data_new$ppt_Fert +
+      beta_new$`diam:ppt_Fert` * data_new$diam * data_new$ppt_Fert +
+      beta_new$tmean_Fert * data_new$temp_Fert +
+      beta_new$`I(tmean_Fert^2)` * data_new$temp_Fert +
+      beta_new$`diam:tmean_Fert` * data_new$diam * data_new$temp_Fert
+    output2$Seeds <- output2$Seeds #- Seeds_baseline
+    
+} else if(i %in% c("Abies grandis", "Abies magnifica", "Abies concolor")) {
+  
+    output2$Seeds <- beta_new$Intercept +
+      beta_new$diam * data_new$diam +
+      beta_new$`I(diam^2)` * data_new$diam +
+      beta_new$precip_budInit * data_new$ppt_budInit +
+      beta_new$`I(precip_budInit^2)` * data_new$ppt_budInit +
+      beta_new$`diam:precip_budInit` * data_new$diam * data_new$ppt_budInit +
+      beta_new$temp_budInit * data_new$temp_budInit +
+      beta_new$`I(temp_budInit^2)` * data_new$temp_budInit +
+      beta_new$`diam:temp_budInit` * data_new$diam * data_new$temp_budInit +
+      beta_new$ppt_Poll * data_new$ppt_Poll +
+      beta_new$`I(ppt_Poll^2)` * data_new$ppt_Poll +
+      beta_new$`diam:ppt_Poll` * data_new$diam * data_new$ppt_Poll +
+      beta_new$tmean_Poll * data_new$temp_Poll +
+      beta_new$`I(tmean_Poll^2)` * data_new$temp_Poll +
+      beta_new$`diam:tmean_Poll` * data_new$diam * data_new$temp_Poll +
+      beta_new$tmean_Fert * data_new$temp_Fert +
+      beta_new$`I(tmean_Fert^2)` * data_new$temp_Fert +
+      beta_new$`diam:tmean_Fert` * data_new$diam * data_new$temp_Fert
+    output2$Seeds <- output2$Seeds #- Seeds_baseline
+    
+}
+    
+    results <- rbind(results, output2)
+  }
+
+  # Join tree coordinates for mapping
+  coords <- tree_data |>
+    dplyr::ungroup() |>
+    dplyr::select(Species, TREE_ID, UTMx, UTMy) |>
+    dplyr::distinct() |>
+    dplyr::rename(X = UTMx, Y = UTMy)
+
+  results |> dplyr::left_join(coords, by = c("Species", "TREE_ID"))
+}
+
+# Jim did interpolate between measurement dates - assume DBH stays the same until the next measurement
+
+```
+
+```{r server}
+library(shiny)
+library(dplyr)
+library(tidyr)
+library(leaflet)
+library(ggplot2)
+library(plotly)
+
+# Fast path: load pre-extracted lookup tables if precompute_climate.R has been run.
+# Fallback: use per-species-year file cache saved from previous raster-extraction runs.
+# If using local computer directory update as needed.
+CLIM_MONTHLY_PATH <- "~/Desktop/MASTIF cone tool/clim_monthly.rds"
+NORM_MONTHLY_PATH <- "~/Desktop/MASTIF cone tool/norm_monthly.rds"
+CLIM_MONTHLY <- if (file.exists(CLIM_MONTHLY_PATH)) readRDS(CLIM_MONTHLY_PATH) else NULL
+NORM_MONTHLY <- if (file.exists(NORM_MONTHLY_PATH)) readRDS(NORM_MONTHLY_PATH) else NULL
+
+# Per-species-year file cache (populated by previous raster-extraction runs).
+RESULT_CACHE_DIR <- tools::R_user_dir("fecundity_results", which = "cache")
+dir.create(RESULT_CACHE_DIR, recursive = TRUE, showWarnings = FALSE)
+
+.load_cached <- function(prefix, sp, yr) {
+  key  <- paste0(prefix, "_", paste(sort(sp), collapse = "__"), "_", yr, ".rds")
+  path <- file.path(RESULT_CACHE_DIR, key)
+  if (file.exists(path)) readRDS(path) else NULL
+}
+
+server <- function(input, output, session) {
+
+  status_msg <- reactiveVal("Select a year and species, then click 'Get Forecasts'.")
+
+  # ---- your defined Species list (used to filter treeNames + UI options) ----
+  Species <- sort(c(
+    "Pinus ponderosa",
+    "Pinus contorta",
+    "Pinus jeffreyi",
+    "Pinus lambertiana",
+    "Pinus monticola",
+    "Quercus kelloggii",
+    "Quercus agrifolia",
+    "Quercus chrysolepis",
+    "Abies magnifica",
+    "Abies grandis",
+    "Abies concolor"
+  ))
+
+  # ---- build treeNames (FIA) once per session ----
+  #change directory to your own
+  treeNames <- reactive({
+    readRDS("/Users/deedeehuebner/Desktop/MASTIF cone tool/treeNames.rds")
+  })
+
+  # ---- species choices (filtered to your Species list) ----
+  observeEvent(treeNames(), {
+    # Intersect just in case FIA names differ slightly
+    sp <- sort(intersect(unique(treeNames()$Species), Species))
+    updateCheckboxGroupInput(session, "species_selected", choices = sp, selected = sp)
+  }, ignoreInit = FALSE)
+
+  observeEvent(input$selectAll, {
+    req(treeNames())
+    sp <- sort(intersect(unique(treeNames()$Species), Species))
+    updateCheckboxGroupInput(session, "species_selected", selected = sp)
+  })
+
+  observeEvent(input$uncheckAll, {
+    updateCheckboxGroupInput(session, "species_selected", selected = character(0))
+  })
+
+  # When 2026 is selected there is no observed data:
+  #   - force scenario mode
+  #   - visually disable the "Use Current Forecast" option
+  #   - update the status bar with a brief explanation
+  # Restores the option when the user moves back to any other year.
+  observeEvent(input$year, {
+    if (isTRUE(input$year == 2026)) {
+      updateRadioButtons(session, "climate_mode", selected = "scenario")
+      session$sendCustomMessage("toggleRadioOption", list(
+        inputId = "climate_mode",
+        value   = "observed",
+        disabled = TRUE,
+        tooltip  = "No observed data available for 2026. Use Custom Scenario to define a forecast."
+      ))
+      status_msg(paste0(
+        "Year 2026: scenario-only \u2014 no observed data available. ",
+        "Adjust the sliders to define your 2026 forecast, then click \u2018Get Forecasts\u2019."
+      ))
+    } else {
+      session$sendCustomMessage("toggleRadioOption", list(
+        inputId  = "climate_mode",
+        value    = "observed",
+        disabled = FALSE,
+        tooltip  = ""
+      ))
+    }
+  }, ignoreInit = TRUE)
+
+  # ---- base map ----
+  output$map <- renderLeaflet({
+    leaflet(options = leafletOptions(zoomControl = TRUE, boxZoom = TRUE)) %>%
+      addProviderTiles(providers$CartoDB.Positron) %>%
+      setView(lng = -119.418, lat = 36.778, zoom = 5)
+  })
+
+  # ---- inset map (observed; populated in compare mode) ----
+  output$inset_map <- renderLeaflet({
+    leaflet(options = leafletOptions(
+      zoomControl = FALSE, attributionControl = FALSE
+    )) %>%
+      addProviderTiles(providers$CartoDB.Positron) %>%
+      setView(lng = -119.418, lat = 36.778, zoom = 5)
+  })
+
+  # ---- compute forecasts on click ----
+  seed_points <- eventReactive(input$runClimate, {
+    req(input$year, input$species_selected, treeNames())
+
+    tn <- treeNames()
+
+    yr           <- as.numeric(input$year)
+    sp           <- sort(input$species_selected)
+    # 2026 has no observed data — scenario mode is always active for it
+    is_2026      <- isTRUE(yr == 2026)
+    use_scenario <- isTRUE(input$climate_mode == "scenario") || is_2026
+    # For 2026 we load 2025 climate as the baseline ("current forecast")
+    clim_yr      <- if (is_2026) 2025 else yr
+    validate(need(length(sp) > 0, "Select at least one species."))
+    status_msg("Computing forecasts...")
+
+    # --- load normals (always needed; year arg only labels the Year column) ---
+    norm_out <- if (!is.null(NORM_MONTHLY)) {
+      getNorm(sp, yr, norm_table = NORM_MONTHLY, tree_names = tn)
+    } else {
+      .load_cached("norm", sp, yr)
+    }
+
+    # --- climate baseline: 2025 data for 2026 scenarios, observed otherwise ---
+    compare_obs <- isTRUE(use_scenario && input$compare_observed)
+    clim_out <- if (!is.null(CLIM_MONTHLY)) {
+      getClimate(sp, clim_yr, clim_table = CLIM_MONTHLY, tree_names = tn)
+    } else {
+      .load_cached("clim", sp, clim_yr)
+    }
+    # Re-label Year so it aligns with norm_out (both must share the same Year
+    # value for the merge inside make_anom / the scenario block to work).
+    if (is_2026 && !is.null(clim_out)) {
+      clim_out <- clim_out |> dplyr::mutate(Year = 2026)
+    }
+    if (is.null(clim_out) || is.null(norm_out)) {
+      status_msg(paste0(
+        "No cached data for: ", paste(sp, collapse = ", "), " (", yr, "). ",
+        "Run precompute_climate.R to enable all species/years."
+      ))
+      return(NULL)
+    }
+
+
+    base_join <- tn |>
+      dplyr::select(Species, TREE_ID, Diameter) |>
+      dplyr::distinct()
+
+    # Helper: build anomaly wide table from a long clim/norm result
+    make_anom <- function(clim_long, norm_long) {
+      merge(clim_long, norm_long) |>
+        dplyr::mutate(Value = Value - normValue) |>
+        dplyr::select(Species, TREE_ID, Year, Phase, Value) |>
+        tidyr::pivot_wider(names_from = Phase, values_from = Value) |>
+        tidyr::drop_na() |>
+        dplyr::left_join(base_join, by = c("Species", "TREE_ID")) |>
+        dplyr::rename(diam = Diameter)
+    }
+
+    make_seeds <- function(anom_df) {
+      getSeeds(anom_df, tn) |>
+        dplyr::mutate(Seeds = log(abs(Seeds) + 1) * sign(Seeds))
+    }
+
+    # --- scenario seeds ---
+    # Anomaly = observed_climate × (1 + dep%) − normal
+    # At 0%: reduces to observed − normal, exactly matching the observed result
+    seeds_scenario <- NULL
+    if (use_scenario) {
+      temp_dep <- input$temp_departure / 100
+      ppt_dep  <- input$ppt_departure  / 100
+      anom_scen <- merge(clim_out, norm_out) |>
+        dplyr::mutate(
+          Value = dplyr::case_when(
+            grepl("temp", Phase) ~ Value * (1 + temp_dep) - normValue,
+            grepl("ppt",  Phase) ~ Value * (1 + ppt_dep)  - normValue,
+            TRUE ~ Value - normValue
+          )
+        ) |>
+        dplyr::select(Species, TREE_ID, Year, Phase, Value) |>
+        tidyr::pivot_wider(names_from = Phase, values_from = Value) |>
+        tidyr::drop_na() |>
+        dplyr::left_join(base_join, by = c("Species", "TREE_ID")) |>
+        dplyr::rename(diam = Diameter)
+      seeds_scenario <- make_seeds(anom_scen)
+    }
+
+    # --- observed seeds (pure observed mode, or compare overlay) ---
+    seeds_obs <- NULL
+    if (!is.null(clim_out) && !is.null(norm_out)) {
+      seeds_obs <- make_seeds(make_anom(clim_out, norm_out))
+    }
+
+    list(
+      seeds          = if (use_scenario) seeds_scenario else seeds_obs,
+      seeds_scenario = seeds_scenario,
+      seeds_obs      = seeds_obs,
+      year           = yr,
+      use_scenario   = use_scenario,
+      compare_obs    = compare_obs,
+      temp_dep       = if (use_scenario) input$temp_departure else NA,
+      ppt_dep        = if (use_scenario) input$ppt_departure  else NA
+    )
+  }, ignoreInit = TRUE)
+
+  observeEvent(seed_points(), ignoreNULL = TRUE, {
+    tryCatch({
+    res <- seed_points()
+    if (is.null(res)) return()
+    seeds        <- res$seeds
+    yr           <- res$year
+    use_scenario <- isTRUE(res$use_scenario)
+    compare_obs  <- isTRUE(res$compare_obs)
+    legend_title <- if (use_scenario) "Log \u0394 Fecundity\n(Scenario)" else "Log \u0394 Fecundity"
+
+    if (is.null(seeds) || nrow(seeds) == 0) {
+      status_msg("Error: getSeeds returned no rows.")
+      return()
+    }
+
+    value_col <- dplyr::case_when(
+      "Seeds"        %in% names(seeds) ~ "Seeds",
+      "logF_current" %in% names(seeds) ~ "logF_current",
+      "fecundity"    %in% names(seeds) ~ "fecundity",
+      "Value"        %in% names(seeds) ~ "Value",
+      TRUE ~ NA_character_
+    )
+    if (is.na(value_col)) {
+      status_msg(paste("Error: no value column. names:", paste(names(seeds), collapse=", ")))
+      return()
+    }
+    if (!all(c("X","Y") %in% names(seeds))) {
+      status_msg(paste("Error: missing X/Y. names:", paste(names(seeds), collapse=", ")))
+      return()
+    }
+
+    # Clear both named groups, any highlight, and all controls before re-drawing
+    proxy <- leafletProxy("map") %>%
+      clearGroup("Scenario") %>%
+      clearGroup("Observed") %>%
+      clearGroup("highlight") %>%
+      clearControls()
+    leafletProxy("inset_map") %>% clearGroup("highlight")
+
+    if (!compare_obs) {
+      # --- single-layer display: preserve existing red-blue palette ---
+      plot_df <- seeds[!is.na(seeds[[value_col]]), ]
+      vals    <- plot_df[[value_col]]
+      pal     <- leaflet::colorNumeric(c("red", "blue"), vals, reverse = FALSE)
+      proxy %>%
+        addCircleMarkers(
+          data = plot_df, lng = ~X, lat = ~Y, radius = 3,
+          color = pal(vals), fillOpacity = 0.8, stroke = FALSE,
+          group = if (use_scenario) "Scenario" else "Observed",
+          popup = ~paste0(
+            "<b>Species:</b> ", Species, "<br>",
+            "<b>Tree:</b> ", TREE_ID, "<br>",
+            "<b>Year:</b> ", yr, "<br>",
+            "<b>Predicted:</b> ", round(get(value_col), 3)
+          )
+        ) %>%
+        addLegend("bottomright", pal = pal, values = vals,
+                  title = legend_title, opacity = 1)
+
+    } else {
+      # --- compare mode: scenario + observed, both red-blue ---
+
+      # Scenario layer
+      if (!is.null(res$seeds_scenario) && nrow(res$seeds_scenario) > 0) {
+        sc      <- res$seeds_scenario[!is.na(res$seeds_scenario[[value_col]]), ]
+        sc_vals <- sc[[value_col]]
+        pal_sc  <- leaflet::colorNumeric(c("red", "blue"), sc_vals, reverse = FALSE)
+        proxy   <- proxy %>%
+          addCircleMarkers(
+            data = sc, lng = ~X, lat = ~Y, radius = 5,
+            color = pal_sc(sc_vals), fillOpacity = 0.85, stroke = FALSE,
+            group = "Scenario",
+            popup = ~paste0(
+              "<b>Species:</b> ", Species, "<br>",
+              "<b>Tree:</b> ", TREE_ID, "<br>",
+              "<b>Year:</b> ", yr, " (Scenario)<br>",
+              "<b>Predicted:</b> ", round(Seeds, 3)
+            )
+          ) %>%
+          addLegend("bottomright", pal = pal_sc, values = sc_vals,
+                    title = "Log Fecundity<br><i>Scenario</i>",
+                    opacity = 1, layerId = "legend_sc")
+      }
+
+      # Observed layer — drawn on the inset map, not the main map
+      if (!is.null(res$seeds_obs) && nrow(res$seeds_obs) > 0) {
+        ob      <- res$seeds_obs[!is.na(res$seeds_obs[[value_col]]), ]
+        ob_vals <- ob[[value_col]]
+        pal_ob  <- leaflet::colorNumeric(c("red", "blue"), ob_vals, reverse = FALSE)
+        leafletProxy("inset_map", data = ob) %>%
+          clearMarkers() %>%
+          clearControls() %>%
+          addCircleMarkers(
+            lng = ~X, lat = ~Y, radius = 3,
+            color = pal_ob(ob_vals), fillOpacity = 0.8, stroke = FALSE,
+            popup = ~paste0(
+              "<b>Species:</b> ", Species, "<br>",
+              "<b>Tree:</b> ", TREE_ID, "<br>",
+              "<b>Year:</b> ", yr, " (Current Forecast)<br>",
+              "<b>Predicted:</b> ", round(Seeds, 3)
+            )
+          ) %>%
+          addLegend("bottomright", pal = pal_ob, values = ob_vals,
+                    title = "Fecundity", opacity = 0.9)
+      } else {
+        status_msg(paste0("Scenario computed; observed data unavailable for ", yr,
+                          ". Run precompute_climate.R to enable comparison."))
+      }
+
+    }
+
+    scenario_label <- if (isTRUE(res$use_scenario)) {
+      temp_sign <- if (res$temp_dep >= 0) "+" else ""
+      ppt_sign  <- if (res$ppt_dep  >= 0) "+" else ""
+      paste0(" | Scenario: Temp ", temp_sign, res$temp_dep, "%, Ppt ",
+             ppt_sign, res$ppt_dep, "%")
+    } else ""
+    status_msg(paste0("Last run: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+                      " | Year: ", yr, " | Points: ", nrow(seeds), scenario_label))
+    }, error = function(e) {
+      status_msg(paste("Error:", conditionMessage(e)))
+    })
+  }, ignoreInit = FALSE)
+
+  output$scatter_plot <- renderPlotly({
+    req(seed_points())
+    res <- seed_points()
+    req(isTRUE(res$use_scenario), isTRUE(res$compare_obs))
+    req(!is.null(res$seeds_scenario), !is.null(res$seeds_obs))
+
+    sc <- res$seeds_scenario |>
+      dplyr::select(Species, TREE_ID, Seeds) |>
+      dplyr::rename(Seeds_scenario = Seeds)
+    ob <- res$seeds_obs |>
+      dplyr::select(Species, TREE_ID, Seeds) |>
+      dplyr::rename(Seeds_obs = Seeds)
+
+    plot_df <- dplyr::inner_join(sc, ob, by = c("Species", "TREE_ID")) |>
+      tidyr::drop_na() |>
+      dplyr::mutate(
+        tooltip = paste0(
+          "<b>Tree:</b> ", TREE_ID, "<br>",
+          "<b>Species:</b> ", Species, "<br>",
+          "<b>Current Forecast:</b> ",  round(Seeds_obs,      3), "<br>",
+          "<b>Scenario:</b> ", round(Seeds_scenario, 3)
+        )
+      )
+    req(nrow(plot_df) > 0)
+
+    rng <- range(c(plot_df$Seeds_scenario, plot_df$Seeds_obs), na.rm = TRUE)
+
+    temp_sign <- if (res$temp_dep >= 0) "+" else ""
+    ppt_sign  <- if (res$ppt_dep  >= 0) "+" else ""
+    base_label <- if (isTRUE(res$year == 2026)) "2025 forecast" else "30-yr normals"
+    subtitle  <- paste0(
+      "Scenario: Temp ", temp_sign, res$temp_dep, "%, Ppt ",
+      ppt_sign, res$ppt_dep, "% \u2022 Year: ", res$year,
+      " (departures from ", base_label, ")"
+    )
+
+    p <- ggplot(plot_df, aes(x = Seeds_obs, y = Seeds_scenario, color = Species, text = tooltip, key = TREE_ID)) +
+      geom_abline(slope = 1, intercept = 0, color = "#888888", linetype = "dashed", linewidth = 0.6) +
+      geom_point(alpha = 0.55, size = 1.5) +
+      coord_equal(xlim = rng, ylim = rng) +
+      labs(
+        x        = "Current log Fecundity",
+        y        = "Scenario log Fecundity",
+        color    = NULL
+      ) +
+      theme_dark() +
+      theme(
+        plot.background   = element_rect(fill = "#111111", color = NA),
+        panel.background  = element_rect(fill = "#1c1c1c", color = NA),
+        text              = element_text(color = "white"),
+        axis.text         = element_text(color = "#cccccc"),
+        axis.title        = element_text(color = "white"),
+        legend.background = element_rect(fill = "#111111"),
+        legend.key        = element_rect(fill = "#111111"),
+        legend.text       = element_text(color = "white"),
+        panel.grid.major  = element_line(color = "#333333"),
+        panel.grid.minor  = element_line(color = "#222222")
+      )
+
+    ggplotly(p, tooltip = "text", source = "scatter_plot") |>
+      layout(
+        paper_bgcolor = "#111111",
+        plot_bgcolor  = "#1c1c1c",
+        font          = list(color = "white"),
+        annotations   = list(
+          list(
+            text      = subtitle,
+            x = 0, xref = "paper", xanchor = "left",
+            y = 1, yref = "paper", yanchor = "bottom",
+            showarrow = FALSE,
+            font      = list(color = "#aaaaaa", size = 11)
+          )
+        ),
+        legend = list(
+          bgcolor     = "#111111",
+          font        = list(color = "white")
+        )
+      ) |>
+      config(displayModeBar = FALSE)
+  })
+
+  # ---- scatter plot click: highlight the selected tree on the map(s) ----
+  observeEvent(event_data("plotly_click", source = "scatter_plot"), {
+    click <- event_data("plotly_click", source = "scatter_plot")
+    req(!is.null(click$key))
+
+    res <- seed_points()
+    req(!is.null(res))
+
+    tid <- click$key
+
+    # Coordinates are identical between obs and scenario; use whichever is available
+    coords_ref <- if (!is.null(res$seeds_obs)) res$seeds_obs else res$seeds
+    tree_loc   <- dplyr::filter(coords_ref, TREE_ID == tid)
+    req(nrow(tree_loc) > 0)
+
+    obs_val  <- if (!is.null(res$seeds_obs))
+      dplyr::filter(res$seeds_obs,      TREE_ID == tid)$Seeds[1] else NA
+    scen_val <- if (!is.null(res$seeds_scenario))
+      dplyr::filter(res$seeds_scenario, TREE_ID == tid)$Seeds[1] else NA
+
+    popup_html <- paste0(
+      "<b>", tree_loc$Species[1], "</b><br>",
+      "Tree ID: ", tid, "<br>",
+      if (!is.na(obs_val))  paste0("Current Forecast: ",  round(obs_val,  3), "<br>") else "",
+      if (!is.na(scen_val)) paste0("Scenario: ", round(scen_val, 3))          else ""
+    )
+
+    # Gold ring on main map; open popup immediately
+    leafletProxy("map") %>%
+      clearGroup("highlight") %>%
+      addCircleMarkers(
+        data = tree_loc, lng = ~X, lat = ~Y,
+        group   = "highlight",
+        radius  = 12, color = "#FFD700", weight = 2.5,
+        fill    = FALSE, opacity = 1,
+        popup   = popup_html,
+        popupOptions = popupOptions(closeOnClick = FALSE)
+      ) %>%
+      showGroup("highlight")
+
+    # Mirror highlight on inset map when in compare mode
+    if (isTRUE(res$compare_obs)) {
+      leafletProxy("inset_map") %>%
+        clearGroup("highlight") %>%
+        addCircleMarkers(
+          data = tree_loc, lng = ~X, lat = ~Y,
+          group  = "highlight",
+          radius = 9, color = "#FFD700", weight = 2,
+          fill   = FALSE, opacity = 1
+        )
+    }
+
+    status_msg(paste0(
+      "Selected: ", tree_loc$Species[1], " \u2022 Tree ", tid,
+      if (!is.na(obs_val))  paste0(" \u2022 Current: ",  round(obs_val,  3)) else "",
+      if (!is.na(scen_val)) paste0(" \u2022 Scenario: ", round(scen_val, 3))  else ""
+    ))
+  })
+
+  output$statusText <- renderText(status_msg())
+}
+```
+
+```{r app}
+shinyApp(ui = ui, server = server)
+```
