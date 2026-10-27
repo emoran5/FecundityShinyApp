@@ -41,10 +41,10 @@ The following files must be present in the same folder as `camp_code_04202026.Rm
 
 ## Running the App
 
-Open `camp_code_04202026.Rmd` in RStudio and click **Run Document**, or run:
+Open `camp_code_10082026.Rmd` in RStudio and click **Run Document**, or run:
 
 ```r
-rmarkdown::run("camp_code_04202026.Rmd")
+rmarkdown::run("camp_code_10082026.Rmd")
 ```
 
 Update the two file paths near the top of the `server` chunk to match your local directory if needed:
