@@ -27,7 +27,7 @@ install.packages(c(
 ```
 
 ### Data files
-The following files must be present in the same folder as `camp_code_04202026.Rmd`:
+The following files must be present in the same folder as `camp_code_010082026.Rmd`:
 
 | File | Description |
 |------|-------------|
